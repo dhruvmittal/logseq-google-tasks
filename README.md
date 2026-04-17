@@ -1,4 +1,4 @@
-# Logseq Google Tasks (Enhanced Fork)
+# Logseq Google Tasks
 
 A Google Tasks integration for Logseq with 2-way synchronization, background automation, and native UI integration.
 
