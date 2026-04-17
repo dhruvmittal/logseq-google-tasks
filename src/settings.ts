@@ -30,5 +30,12 @@ export default function settingSchema() {
       description: "",
       default: "",
     },
+    {
+      key: "target_list_name",
+      type: "string",
+      title: "Target Google Tasks List",
+      description: "Local Logseq TODOs will be synced to this list. Use '@default' for your primary list.",
+      default: "Logseq Tasks",
+    },
   ]);
 }

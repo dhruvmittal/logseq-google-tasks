@@ -161,6 +161,8 @@ export async function handleSync(progressCallback: (progress: number) => void, p
   }
 
   try {
+    progressMessageCallback("Pushing local TODOs to Google...");
+    await pushNativeTodosToGoogle();
     await syncGoogleTasks(progressCallback, progressMessageCallback, setIsSyncing);
   } catch (error: any) {
     let httpError = error as HttpError;
@@ -256,19 +258,111 @@ async function syncGoogleTasks(progressCallback: (progress: number) => void, pro
 
     // A better way to handle target block, even if for new page
     let targetBlock = pageBlocksTree[pageBlocksTree.length - 1];
-    console.debug(targetBlock);
-
-    let tasksNew = await Promise.all(tasks.map(async ([list, task]) => {
+    
+    let generatedTasks = await Promise.all(tasks.map(async ([list, task]) => {
       return await blockContentGenerate(list, task);
     }));
 
-    console.debug(tasksNew);
-
-    logseq.Editor.insertBatchBlock(targetBlock.uuid, tasksNew);
+    if (!targetBlock) {
+      // Empty page, bootstrap with first block then batch others
+      const firstTask = generatedTasks[0];
+      const createdBlock = await logseq.Editor.appendBlockInPage(pageEntity.uuid, firstTask.content, { properties: firstTask.properties });
+      
+      if (createdBlock) {
+        if (generatedTasks.length > 1) {
+          await logseq.Editor.insertBatchBlock(createdBlock.uuid, generatedTasks.slice(1));
+        }
+        
+        if (firstTask.children && firstTask.children.length > 0) {
+          await logseq.Editor.insertBatchBlock(createdBlock.uuid, firstTask.children, { sibling: false });
+        }
+      }
+    } else {
+      console.debug(targetBlock);
+      logseq.Editor.insertBatchBlock(targetBlock.uuid, generatedTasks);
+    }
   }
 
   progressCallback(100);
   setIsSyncing(false);
+}
+
+/**
+ * Pushes local Logseq TODOs that are not yet tracked to Google Tasks.
+ */
+async function pushNativeTodosToGoogle() {
+  const targetListName = logseq.settings?.target_list_name || "Logseq Tasks";
+  
+  // 1. Find or create the list
+  const taskLists = await fetchTaskLists() || [];
+  let targetList = taskLists.find(l => l.title === targetListName);
+  
+  if (!targetList) {
+    if (targetListName === "@default") {
+        targetList = taskLists.find(l => l.id === "@default");
+    } else {
+        console.info(`#${pluginId}: Creating new task list: ${targetListName}`);
+        const response = await gapi.client.tasks.tasklists.insert({
+          resource: { title: targetListName }
+        });
+        targetList = response.result;
+    }
+  }
+
+  if (!targetList) {
+      throw new Error(`Could not find or create target list: ${targetListName}`);
+  }
+
+  // 2. Query Logseq for active TODOs without google-task-id
+  const query = `
+    [:find (pull ?b [*])
+     :where
+     [?b :block/marker ?marker]
+     [(contains? #{"TODO" "DOING" "NOW" "LATER" "WAITING"} ?marker)]
+     (not [?b :block/properties ?props]
+          [(get ?props :google-task-id)])]
+  `;
+  
+  const results = await logseq.DB.datascriptQuery(query);
+  const blocks = results?.map((r: any) => r[0]) || [];
+
+  if (blocks.length === 0) {
+    console.info(`#${pluginId}: No new local TODOs to sync.`);
+    return;
+  }
+
+  console.info(`#${pluginId}: Pushing ${blocks.length} local TODOs to Google Tasks.`);
+  
+  for (const block of blocks) {
+    try {
+      let taskTitle = block.content
+        .replace(/^(DONE|TODO|DOING|NOW|LATER|WAITING)? /, '')
+        .replace(/\nDEADLINE: [^\n]*/g, '')
+        .replace(/\n[^\n]*:: [^\n]*/g, '')
+        .replace(/^[^\n]*:: [^\n]*\n/g, '');
+
+      const newTask = {
+        title: taskTitle || "Unnamed Task",
+        status: (block.marker === 'DONE' || block.marker === 'CANCELLED') ? 'completed' : 'needsAction'
+      };
+
+      const response = await gapi.client.tasks.tasks.insert({
+        tasklist: targetList.id,
+        resource: newTask
+      });
+
+      const googleTask = response.result;
+
+      // Update Logseq block with the new IDs
+      await logseq.Editor.upsertBlockProperty(block.uuid, "google-task-id", googleTask.id);
+      await logseq.Editor.upsertBlockProperty(block.uuid, "google-task-list-id", targetList.id);
+      await logseq.Editor.upsertBlockProperty(block.uuid, "google-task-updated", googleTask.updated);
+      
+      console.debug(`#${pluginId}: Synced local block ${block.uuid} to Google Task ${googleTask.id}`);
+    } catch (e) {
+      console.error(`#${pluginId}: Failed to sync local block ${block.uuid}`, e);
+    }
+  }
 }
 
 /**
@@ -452,15 +546,6 @@ async function blockContentGenerate(list: gapi.client.tasks.TaskList, task: gapi
   }
   if (task.deleted) {
     taskBlock.properties["google-task-deleted"] = task.deleted;
-  }
-
-  let taskDueDate: string | undefined;
-  if (task.due) {
-    taskDueDate = format(
-      new Date(task.due),
-      preferredDateFormat,
-    );
-    taskBlock.content += `\nDEADLINE: <${taskDueDate}>`;
   }
 
   let taskCompletedDate: string | undefined;
