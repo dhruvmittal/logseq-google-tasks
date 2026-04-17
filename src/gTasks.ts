@@ -421,7 +421,6 @@ async function fetchTasks(taskListId: string, updatedMin: string | null): Promis
         'showHidden': true,
         'showDeleted': true,
         'showCompleted': true,
-        ...(updatedMin ? { updatedMin } : {})
       }
     });
     console.debug(response.result);
@@ -634,7 +633,7 @@ async function pushLocalChanges(block: BlockEntity, task: gapi.client.tasks.Task
   let needsUpdate = false;
   let taskNew = { ...task };
   let taskTitle = block.content
-    .replace(/^(DONE|TODO)? /, '')
+    .replace(/^(DONE|TODO|DOING|NOW|LATER|WAITING)? /, '')
     .replace(/\nDEADLINE: [^\n]*/g, '')
     .replace(/\n[^\n]*:: [^\n]*/g, '')
     .replace(/^[^\n]*:: [^\n]*\n/g, '');
@@ -646,7 +645,10 @@ async function pushLocalChanges(block: BlockEntity, task: gapi.client.tasks.Task
   }
 
   // Handle status update
-  if (block.marker === 'DONE' && task.status === 'needsAction') {
+  const completedMarkers = ['DONE', 'CANCELLED'];
+  const actionMarkers = ['TODO', 'DOING', 'NOW', 'LATER', 'WAITING'];
+
+  if (completedMarkers.includes(block.marker || '') && task.status === 'needsAction') {
     taskNew.status = 'completed';
     // Logseq by default does not have completed date recorded for tasks.
     // This is now a feature provided by a plugin, which links to a jdournal,
@@ -661,7 +663,7 @@ async function pushLocalChanges(block: BlockEntity, task: gapi.client.tasks.Task
     }
     needsUpdate = true;
   }
-  if (block.marker === 'TODO' && task.status === 'completed') {
+  if (actionMarkers.includes(block.marker || '') && task.status === 'completed') {
     taskNew.status = 'needsAction';
     delete taskNew.completed;
     needsUpdate = true;
