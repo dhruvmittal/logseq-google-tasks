@@ -16,23 +16,6 @@ function main() {
 
   settingSchema();
 
-  logseq.provideModel({
-    async syncNow() {
-      await handleSync(false);
-    },
-  });
-
-  const provideHideStyle = () => {
-    logseq.provideStyle({
-      key: 'google-tasks-hide-properties',
-      style: logseq.settings?.hide_properties ? css`
-        .block-properties > div[data-property-key^="google-task-"] {
-          display: none !important;
-        }
-      ` : ''
-    });
-  };
-
   logseq.provideStyle(css`
     .google-tasks-trigger-icon {
       width: 18px;
@@ -43,11 +26,7 @@ function main() {
     }
   `);
 
-  provideHideStyle();
 
-  logseq.onSettingsChanged(() => {
-    provideHideStyle();
-  });
 
 
   logseq.App.registerUIItem("toolbar", {
@@ -97,8 +76,13 @@ function main() {
     }
   };
 
+  logseq.provideModel({
+    async syncNow() {
+      await handleSync(false);
+    },
+  });
+
   logseq.onSettingsChanged(() => {
-    provideHideStyle();
     startAutoSync();
   });
   

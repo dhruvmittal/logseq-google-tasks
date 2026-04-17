@@ -38,13 +38,6 @@ export default function settingSchema() {
       default: "Logseq Tasks",
     },
     {
-      key: "hide_properties",
-      type: "boolean",
-      title: "Hide Google Tasks Properties",
-      description: "Hide Google Task metadata (IDs, links, etc.) from the Logseq UI. Properties remain in the data but are invisible.",
-      default: false,
-    },
-    {
       key: "auto_sync_enabled",
       type: "boolean",
       title: "Enable Automatic Background Sync",
