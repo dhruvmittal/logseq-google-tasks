@@ -30,5 +30,26 @@ export default function settingSchema() {
       description: "",
       default: "",
     },
+    {
+      key: "target_list_name",
+      type: "string",
+      title: "Target Google Tasks List",
+      description: "Local Logseq TODOs will be synced to this list. Use '@default' for your primary list.",
+      default: "Logseq Tasks",
+    },
+    {
+      key: "auto_sync_enabled",
+      type: "boolean",
+      title: "Enable Automatic Background Sync",
+      description: "Automatically synchronize tasks in the background.",
+      default: false,
+    },
+    {
+      key: "auto_sync_interval_minutes",
+      type: "number",
+      title: "Auto Sync Interval (Minutes)",
+      description: "How often to trigger the automatic background sync. Minimum 1 minute.",
+      default: 15,
+    },
   ]);
 }

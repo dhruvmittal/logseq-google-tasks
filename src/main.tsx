@@ -2,10 +2,7 @@ import "@logseq/libs";
 
 import settingSchema from "./settings";
 
-import React from "react";
-import ReactDOM from "react-dom/client";
-
-import App from "./App";
+import { handleSync } from "./gTasks";
 
 import "virtual:uno.css";
 
@@ -19,17 +16,6 @@ function main() {
 
   settingSchema();
 
-  const node = ReactDOM.createRoot(document.getElementById("app")!);
-  node.render(<App />);
-
-  logseq.provideModel(function() {
-    return {
-      async toggle() {
-        logseq.toggleMainUI();
-      },
-    };
-  }());
-
   logseq.provideStyle(css`
     .google-tasks-trigger-icon {
       width: 18px;
@@ -40,22 +26,70 @@ function main() {
     }
   `);
 
-  logseq.setMainUIInlineStyle({
-    zIndex: 11,
-    maxHeight: "calc(100% - 50px)",
-    top: "50px",
-  });
+
+
 
   logseq.App.registerUIItem("toolbar", {
     key: "logseq-google-tasks",
     template: `
-    <a data-on-click="toggle">
+    <a data-on-click="syncNow" title="Sync Google Tasks">
       <div class="google-tasks-trigger-icon"></div>
     </a>
   `,
   });
 
-  logseq.App.onGoogleAuthTokenReceived((payload) => {
+  logseq.App.registerCommandPalette(
+    {
+      key: "sync-google-tasks-now",
+      label: "Google Tasks: Synchronize Now",
+    },
+    async () => {
+      await handleSync(false);
+    }
+  );
+
+  logseq.App.registerCommandPalette(
+    {
+      key: "open-google-tasks-settings",
+      label: "Google Tasks: Open Settings",
+    },
+    () => {
+      logseq.showSettingsUI();
+    }
+  );
+
+  // Background sync daemon Let's use setInterval
+  let syncInterval: ReturnType<typeof setInterval> | null = null;
+  const startAutoSync = () => {
+    if (syncInterval) {
+      clearInterval(syncInterval);
+      syncInterval = null;
+    }
+    if (logseq.settings?.auto_sync_enabled) {
+      const mins = Number(logseq.settings?.auto_sync_interval_minutes) || 15;
+      const ms = Math.max(1, mins) * 60 * 1000;
+      console.info(`#${pluginId}: Starting auto-sync every ${mins} minutes`);
+      syncInterval = setInterval(() => {
+        console.info(`#${pluginId}: Triggering background sync...`);
+        handleSync(true).catch(e => console.error(e));
+      }, ms);
+    }
+  };
+
+  logseq.provideModel({
+    async syncNow() {
+      await handleSync(false);
+    },
+  });
+
+  logseq.onSettingsChanged(() => {
+    startAutoSync();
+  });
+  
+  startAutoSync();
+
+
+  ;(logseq.App as any).onGoogleAuthTokenReceived((payload: any) => {
     console.info(`#${pluginId}: ` + "Google Auth Token Received");
     console.debug(payload);
 

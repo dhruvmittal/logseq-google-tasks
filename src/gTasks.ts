@@ -20,13 +20,8 @@ async function authGapi() {
     return;
   }
 
-  let scope = "openid profile email https://www.googleapis.com/auth/tasks";
-
-  await logseq.App.invokeGoogleAuth(
-    logseq.settings!.client_id as string,
-    logseq.settings!.client_secret as string,
-    scope
-  );
+  logseq.UI.showMsg("Standard Logseq builds do not natively support Google OAuth prompts. Please generate a Refresh Token manually and paste it into the plugin settings.", 'error');
+  logseq.showSettingsUI();
 }
 
 async function initGapi() {
@@ -60,8 +55,9 @@ async function initGapi() {
       'maxResults': 100,
     });
   }
-  catch (error: HttpError) {
-    if (error.status === 401) {
+  catch (error: any) {
+    let httpError = error as HttpError;
+    if (httpError.status === 401) {
       return false;
     }
   }
@@ -69,100 +65,137 @@ async function initGapi() {
   return true;
 }
 
-export async function handleSync(progressCallback: (progress: number) => void, progressMessageCallback: (message: string) => void, setIsSyncing: (isSyncing: boolean) => void) {
-  setIsSyncing(true);
-  progressCallback(0);
-  progressMessageCallback("Authenticating...")
+let lastSyncTime: string | null = null;
+let currentToastKey: string = '';
+
+export async function handleSync(isAutoSync: boolean = false) {
+  let progress = 0;
+  
+  const showProgress = async (msg: string, pct: number) => {
+    progress = pct;
+    if (isAutoSync) return; // Silent if auto sync
+
+    const filledLength = Math.round((pct / 100) * 10);
+    const bar = `[${'█'.repeat(filledLength)}${'░'.repeat(10 - filledLength)}]`;
+    const fullMsg = `${bar} ${Math.round(pct)}% - ${msg}`;
+    
+    if (currentToastKey) {
+       await logseq.UI.showMsg(fullMsg, 'info', { key: currentToastKey, timeout: 5000 });
+    } else {
+       currentToastKey = await logseq.UI.showMsg(fullMsg, 'info', { timeout: 5000 });
+    }
+  };
+
+  await showProgress("Authenticating...", 0);
 
   if (!logseq.settings!.access_token && !logseq.settings!.refresh_token) {
     console.info(`#${pluginId}: ` + "No tokens, start auth flow.");
-
-    await authGapi();
-
-    setIsSyncing(false);
-
-    // No point to continue the rest is async
+    if (!isAutoSync) await authGapi();
     return;
   }
 
   // We have refresh token, let's try if it is still valid
   if (logseq.settings!.refresh_token) {
-    console.debug(`#${pluginId}: ` + "Access token: " + logseq.settings!.access_token);
-
     // Can not init GAPI, try to refresh token
     if (!await initGapi()) {
       if (!logseq.settings!.refresh_token) {
         console.error(`#${pluginId}: ` + "Refresh Token is not set, please re-authenticate.");
-        logseq.UI.showMsg("Refresh Token is not set, please re-authenticate.", 'error');
-        logseq.showSettingsUI();
-
-        setIsSyncing(false);
-
+        if (!isAutoSync) {
+            logseq.UI.showMsg("Refresh Token is not set, please re-authenticate.", 'error');
+            logseq.showSettingsUI();
+        }
         return;
       }
 
-      console.debug(`#${pluginId}: ` + "Client ID: " + logseq.settings!.client_id);
-      console.debug(`#${pluginId}: ` + "Client Secret: " + logseq.settings!.client_secret);
-      console.debug(`#${pluginId}: ` + "Refresh Token: " + logseq.settings!.refresh_token);
+      try {
+        const response = await fetch('https://oauth2.googleapis.com/token', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+          body: new URLSearchParams({
+            client_id: logseq.settings!.client_id as string,
+            client_secret: logseq.settings!.client_secret as string,
+            refresh_token: logseq.settings!.refresh_token as string,
+            grant_type: 'refresh_token',
+          }),
+        });
 
-      console.error(`#${pluginId}: ` + 'Access token expired, attempting to refresh token');
-      logseq.UI.showMsg("Google Tasks Access token expired, attempting to refresh token", 'warning');
+        if (!response.ok) {
+          throw new Error(`Refresh token failed: ${response.statusText}`);
+        }
 
-      await logseq.App.refreshGoogleAuth(
-        logseq.settings!.client_id as string,
-        logseq.settings!.client_secret as string,
-        logseq.settings!.refresh_token as string
-      );
+        const data = await response.json();
 
-      // sleep for a while to wait for the token to be updated
-      await new Promise(resolve => setTimeout(resolve, 1000));
+        if (data.access_token) {
+          logseq.updateSettings({ access_token: data.access_token });
+          let token = JSON.parse('{"access_token":"' + data.access_token + '"}');
+          gapi.client.setToken(token);
+        } else {
+          throw new Error('No access token in refresh response');
+        }
+      } catch (e: any) {
+        console.error(`#${pluginId}: Error automatically refreshing Google Tasks token:`, e);
+        if (!isAutoSync) {
+            logseq.UI.showMsg("Failed to automatically refresh Google Tasks token. Please check your credentials in settings.", 'error');
+            logseq.showSettingsUI();
+        }
+        return;
+      }
     }
   }
 
-  progressCallback(5);
+  await showProgress("Init GAPI...", 5);
 
   // Can not init GAPI, try to re-authenticate
   if (!await initGapi()) {
     console.error(`#${pluginId}: ` + "Failed to refresh token, trying to re-authenticate.");
-    logseq.UI.showMsg("Failed to refresh token, tring to re-authenticate.", 'warning');
-    console.debug(`#${pluginId}: ` + "Client ID: " + logseq.settings!.client_id);
-    console.debug(`#${pluginId}: ` + "Client Secret: " + logseq.settings!.client_secret);
-    console.debug(`#${pluginId}: ` + "Refresh Token: " + logseq.settings!.refresh_token);
-    console.debug(`#${pluginId}: ` + "Access token: " + logseq.settings!.access_token);
-    await authGapi();
-
-    setIsSyncing(false);
-
-    // No point to continue the rest is async
+    if (!isAutoSync) {
+        logseq.UI.showMsg("Failed to refresh token, tring to re-authenticate.", 'warning');
+        await authGapi();
+    }
     return;
   }
 
   try {
-    await syncGoogleTasks(progressCallback, progressMessageCallback, setIsSyncing);
+    await showProgress("Pushing local TODOs to Google...", 10);
+    await pushNativeTodosToGoogle();
+    
+    const tokenToUse = isAutoSync ? lastSyncTime : null;
+    await syncGoogleTasks(isAutoSync, showProgress, tokenToUse);
+    
+    lastSyncTime = new Date().toISOString();
+    
+    if (!isAutoSync) {
+        await logseq.UI.showMsg("Sync Complete!", 'success');
+    }
+    currentToastKey = '';
   } catch (error: any) {
+    currentToastKey = '';
     let httpError = error as HttpError;
     if (httpError.status === 401) {
       console.error(`#${pluginId}: ` + 'Google Tasks Access token expired, something went wrong.');
-      logseq.UI.showMsg("Google Tasks Access token expired, something went wrong.", 'error');
-      logseq.showSettingsUI();
+      if (!isAutoSync) {
+          logseq.UI.showMsg("Google Tasks Access token expired, something went wrong.", 'error');
+          logseq.showSettingsUI();
+      }
     }
     else {
       console.error(`#${pluginId}: ` + 'Error syncing Google Tasks');
       console.error(error);
-      logseq.UI.showMsg("Error syncing Google Tasks", 'error');
+      if (!isAutoSync) logseq.UI.showMsg("Error syncing Google Tasks", 'error');
     }
-    setIsSyncing(false);
   }
 }
 
-async function syncGoogleTasks(progressCallback: (progress: number) => void, progressMessageCallback: (message: string) => void, setIsSyncing: (isSyncing: boolean) => void) {
+async function syncGoogleTasks(isAutoSync: boolean, showProgress: (msg: string, pct: number) => Promise<void>, updatedMin: string | null) {
   console.info(`#${pluginId}: ` + "Start Syncing Google Tasks");
 
   let taskLists = await fetchTaskLists() ?? [];
 
   let tasksArray = (await Promise.all(taskLists.map(
     async (taskList: any) => {
-      let tasks = await fetchTasks(taskList.id) ?? [];
+      let tasks = await fetchTasks(taskList.id, updatedMin) ?? [];
 
       return tasks.map((task: any) => {
         return [taskList, task];
@@ -170,7 +203,7 @@ async function syncGoogleTasks(progressCallback: (progress: number) => void, pro
     }
   ))).flat();
 
-  progressCallback(10);
+  await showProgress("Fetching task lists...", 20);
 
   let tasksNew: { [key: string]: any[] } = {}
 
@@ -179,8 +212,7 @@ async function syncGoogleTasks(progressCallback: (progress: number) => void, pro
 
   for (let taskArray of tasksArray) {
     currentTask++;
-    progressCallback(10 + 80 * currentTask / totalTasks);
-    progressMessageCallback(`Syncing task ${currentTask} of ${totalTasks}`);
+    await showProgress(`Parsing task ${currentTask} of ${totalTasks}`, 20 + Math.round(60 * currentTask / (totalTasks || 1)));
     console.debug(`#${pluginId}: ` + `Syncing task ${currentTask} of ${totalTasks}`);
 
     let [list, task] = taskArray as [any, any];
@@ -219,7 +251,7 @@ async function syncGoogleTasks(progressCallback: (progress: number) => void, pro
     }
   }
 
-  progressMessageCallback("Inserting tasks to Logseq...");
+  await showProgress("Inserting tasks to Logseq...", 90);
 
   for (let [parentName, tasks] of Object.entries(tasksNew)) {
     let pageEntity = await ensurePage(parentName, false);
@@ -233,19 +265,110 @@ async function syncGoogleTasks(progressCallback: (progress: number) => void, pro
 
     // A better way to handle target block, even if for new page
     let targetBlock = pageBlocksTree[pageBlocksTree.length - 1];
-    console.debug(targetBlock);
-
-    let tasksNew = await Promise.all(tasks.map(async ([list, task]) => {
+    
+    let generatedTasks = await Promise.all(tasks.map(async ([list, task]) => {
       return await blockContentGenerate(list, task);
     }));
 
-    console.debug(tasksNew);
-
-    logseq.Editor.insertBatchBlock(targetBlock.uuid, tasksNew);
+    if (!targetBlock) {
+      // Empty page, bootstrap with first block then batch others
+      const firstTask = generatedTasks[0];
+      const createdBlock = await logseq.Editor.appendBlockInPage(pageEntity.uuid, firstTask.content, { properties: firstTask.properties });
+      
+      if (createdBlock) {
+        if (generatedTasks.length > 1) {
+          await logseq.Editor.insertBatchBlock(createdBlock.uuid, generatedTasks.slice(1));
+        }
+        
+        if (firstTask.children && firstTask.children.length > 0) {
+          await logseq.Editor.insertBatchBlock(createdBlock.uuid, firstTask.children, { sibling: false });
+        }
+      }
+    } else {
+      console.debug(targetBlock);
+      logseq.Editor.insertBatchBlock(targetBlock.uuid, generatedTasks);
+    }
   }
 
-  progressCallback(100);
-  setIsSyncing(false);
+  await showProgress("Completing...", 100);
+}
+
+/**
+ * Pushes local Logseq TODOs that are not yet tracked to Google Tasks.
+ */
+async function pushNativeTodosToGoogle() {
+  const targetListName = logseq.settings?.target_list_name || "Logseq Tasks";
+  
+  // 1. Find or create the list
+  const taskLists = await fetchTaskLists() || [];
+  let targetList = taskLists.find(l => l.title === targetListName);
+  
+  if (!targetList) {
+    if (targetListName === "@default") {
+        targetList = taskLists.find(l => l.id === "@default");
+    } else {
+        console.info(`#${pluginId}: Creating new task list: ${targetListName}`);
+        const response = await gapi.client.tasks.tasklists.insert({
+          resource: { title: targetListName }
+        });
+        targetList = response.result;
+    }
+  }
+
+  if (!targetList) {
+      throw new Error(`Could not find or create target list: ${targetListName}`);
+  }
+
+  // 2. Query Logseq for active TODOs without google-task-id
+  const query = `
+    [:find (pull ?b [*])
+     :where
+     [?b :block/marker ?marker]
+     [(contains? #{"TODO" "DOING" "NOW" "LATER" "WAITING"} ?marker)]
+     (not [?b :block/properties ?props]
+          [(get ?props :google-task-id)])]
+  `;
+  
+  const results = await logseq.DB.datascriptQuery(query);
+  const blocks = results?.map((r: any) => r[0]) || [];
+
+  if (blocks.length === 0) {
+    console.info(`#${pluginId}: No new local TODOs to sync.`);
+    return;
+  }
+
+  console.info(`#${pluginId}: Pushing ${blocks.length} local TODOs to Google Tasks.`);
+  
+  for (const block of blocks) {
+    try {
+      let taskTitle = block.content
+        .replace(/^(DONE|TODO|DOING|NOW|LATER|WAITING)? /, '')
+        .replace(/\nDEADLINE: [^\n]*/g, '')
+        .replace(/\n[^\n]*:: [^\n]*/g, '')
+        .replace(/^[^\n]*:: [^\n]*\n/g, '');
+
+      const newTask = {
+        title: taskTitle || "Unnamed Task",
+        status: (block.marker === 'DONE' || block.marker === 'CANCELLED') ? 'completed' : 'needsAction'
+      };
+
+      const response = await gapi.client.tasks.tasks.insert({
+        tasklist: targetList.id,
+        resource: newTask
+      });
+
+      const googleTask = response.result;
+
+      // Update Logseq block with the new IDs
+      await logseq.Editor.upsertBlockProperty(block.uuid, "google-task-id", googleTask.id);
+      await logseq.Editor.upsertBlockProperty(block.uuid, "google-task-list-id", targetList.id);
+      await logseq.Editor.upsertBlockProperty(block.uuid, "google-task-updated", googleTask.updated);
+      
+      console.debug(`#${pluginId}: Synced local block ${block.uuid} to Google Task ${googleTask.id}`);
+    } catch (e) {
+      console.error(`#${pluginId}: Failed to sync local block ${block.uuid}`, e);
+    }
+  }
 }
 
 /**
@@ -279,7 +402,7 @@ async function fetchTaskLists(): Promise<gapi.client.tasks.TaskList[] | undefine
  * @param taskListId - The ID of the task list.
  * @returns A promise that resolves to an array of tasks.
  */
-async function fetchTasks(taskListId: string): Promise<gapi.client.tasks.Task[] | undefined> {
+async function fetchTasks(taskListId: string, updatedMin: string | null): Promise<gapi.client.tasks.Task[] | undefined> {
   let tasks: any[] = [];
   let nextPageToken;
   do {
@@ -431,15 +554,6 @@ async function blockContentGenerate(list: gapi.client.tasks.TaskList, task: gapi
     taskBlock.properties["google-task-deleted"] = task.deleted;
   }
 
-  let taskDueDate: string | undefined;
-  if (task.due) {
-    taskDueDate = format(
-      new Date(task.due),
-      preferredDateFormat,
-    );
-    taskBlock.content += `\nDEADLINE: <${taskDueDate}>`;
-  }
-
   let taskCompletedDate: string | undefined;
   if (task.completed) {
     taskCompletedDate = format(
@@ -519,7 +633,7 @@ async function pushLocalChanges(block: BlockEntity, task: gapi.client.tasks.Task
   let needsUpdate = false;
   let taskNew = { ...task };
   let taskTitle = block.content
-    .replace(/^(DONE|TODO)? /, '')
+    .replace(/^(DONE|TODO|DOING|NOW|LATER|WAITING)? /, '')
     .replace(/\nDEADLINE: [^\n]*/g, '')
     .replace(/\n[^\n]*:: [^\n]*/g, '')
     .replace(/^[^\n]*:: [^\n]*\n/g, '');
@@ -531,7 +645,10 @@ async function pushLocalChanges(block: BlockEntity, task: gapi.client.tasks.Task
   }
 
   // Handle status update
-  if (block.marker === 'DONE' && task.status === 'needsAction') {
+  const completedMarkers = ['DONE', 'CANCELLED'];
+  const actionMarkers = ['TODO', 'DOING', 'NOW', 'LATER', 'WAITING'];
+
+  if (completedMarkers.includes(block.marker || '') && task.status === 'needsAction') {
     taskNew.status = 'completed';
     // Logseq by default does not have completed date recorded for tasks.
     // This is now a feature provided by a plugin, which links to a jdournal,
@@ -546,7 +663,7 @@ async function pushLocalChanges(block: BlockEntity, task: gapi.client.tasks.Task
     }
     needsUpdate = true;
   }
-  if (block.marker === 'TODO' && task.status === 'completed') {
+  if (actionMarkers.includes(block.marker || '') && task.status === 'completed') {
     taskNew.status = 'needsAction';
     delete taskNew.completed;
     needsUpdate = true;
