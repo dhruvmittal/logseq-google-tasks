@@ -1,80 +1,49 @@
-Logseq Plugin Google Tasks
-==========================
+# Logseq Google Tasks (Enhanced Fork)
 
-A Logseq plugin that does bidirectional synchoroization with Google Tasks.
+A Google Tasks integration for Logseq with 2-way synchronization, background automation, and native UI integration.
+
+This plugin is a fork of [logseq-google-tasks](https://github.com/weynhamz/logseq-google-tasks) created by **[weynhamz](https://github.com/weynhamz)**. I couldn't get it working out of the box, so I figured I'd give it a go myself. I've added a few features that I wanted like background sync and automatic token renewal, and resolved some of the crashes I was experiencing. 
 
 ![Google Tasks Blocks](https://discuss.logseq.com/uploads/default/original/3X/5/4/54980ce488f154d7219d4c68ae5b7a920384aed3.png)
 
-## Set up
+## Key Improvements
 
-Hasn't figured out a best way to perform Google Oauth2 with Logseq plugin yet, currently, user needs to maually get `access_token` and then add to Logseq plugin settings. Google's access token expires around 1 hour. If anyone has a better way of solving this, suggetions and PRs are welcome.
+### 1. 2-Way Sync
+- **Full Marker Support:** Kind of supports all Logseq marker cycles (`TODO`, `DOING`, `NOW`, `LATER`, `WAITING`, `DONE`, `CANCELLED`).
+- **Upward Sync:** Native Logseq TODOs are automatically pushed to a dedicated Google Task list (default: "Logseq Tasks").
+- **Delta Sync Logic:** Optimized synchronization that respects both local and remote changes accurately.
 
-For now, follow till "Authorize credentials for a desktop application" section of this document https://developers.google.com/tasks/quickstart/nodejs, save the `credentials.json` to auth/ folder and then run `pnpm node index.js`, the access_token will be printed on the screen, grab it and save it in the plugin settings, valid for one hour.
+### 2. Minimal UI
+- **One-Click Sync:** Clicking the toolbar icon triggers an immediate background sync. No clunky dialog boxes or popups.
+- **Progress Tracking:** High-visibility ASCII progress bars (`[██████░░░░] 60%`) via Logseq's native toast notification system.
+- **Command Palette:** Registration of native commands for "Synchronize Now" and "Open Settings".
 
-Join discussion [here](https://discuss.logseq.com/t/sync-google-tasks-let-me-know-what-you-think-about-my-first-logseq-plugin/26705).
+### 3. Background Automation
+- **Auto-Sync Daemon:** Configurable background synchronization intervals (e.g., every 15 minutes).
+- **Silent Auth Renewal:** Background token refreshing is handled quietly without intrusive warning messages or user intervention.
+
+## Setup
+
+### Prerequisites 
+
+#### NixOS / Linux
+This project is built using **Nix** for a reproducible environment.
+1. Enter the development shell: `nix develop`
+2. Install dependencies: `pnpm install`
+3. Build the plugin: `pnpm build`
+
+#### Other (probably)
+1. Install pnpm
+2. Install dependencies: `pnpm install`
+3. Build the plugin: `pnpm build`
+ 
+### Google OAuth Configuration (one-time only)
+1. Follow the [Google Tasks Quickstart](https://developers.google.com/tasks/quickstart/nodejs) to obtain your `client_id` and `client_secret`.
+2. Save your secrets at `secrets/credentials.json` and run the manual token helper: `nix develop -c node get_token.js`
+3. Paste the generated `refresh_token` into the plugin settings in Logseq.
 
 ## Usage
-
-`Cmd + Shift + P` search for `Sync Google Tasks` command.
-
-
-## Current Behavior
-
-The principle this plugin follows is that, the task should be logged as part of the journal upon creation, then use block reference to plan it in the on-going daily aganda. As Google Tasks doesn't really record the creation time of a task, this plugin will do its best to determine the creation date by comparing the updated time and due date of a task, and insert the task to corresponding journal page.
-
-It will use block attributes to keep task id, task list id, task updated time for reference, and reference the task list locally as `GTasks/TaskListTitle`.
-
-Local changes to synced task will also be pushed to Google Tasks only if the local recorded gtask updated time is the same as remote, if not, local will be updated, and local change will be lost.
-
-Don't change any of the `google-task-*` block attributes.
-
-
-## Stories Backlog
-
-* DONE Add a Logseq command to sync Google Tasks to Logseq `GTasks/${TaskListTitle}` pages.
-    * Record important metadata as Logseq block attributes.
-    * Google Task should be synced as Logseq Task natively, including task marker, deadline, completion date etc.
-* DONE New Google Task should be synced down to Logseq upon each synchoronization.
-* DONE Changes on Google Task for already synced task should be updated upon each synchoronization.
-    * Handl children `notes` and `links` blocks as well.
-* DONE Sync Google Task to Logseq Journal pages rather than `GTasks/${TaskListTitle}` pages.
-    * Google Task should be inerted to the journal page as close as possible of its creation date.
-    * Use updatetime or due date as the creation time of the tasks.
-* CANCELED Handle move a Google Task between Task list in Logseq properly.
-    * Should move bettwen pages in `GTasks/${TaskListTitle}` pLogseq.
-    * This work is no longer needed, if tasks are added directly to journal pages, only refernece `GTasks/${TaskListTitle}`.
-    * Keep all tasks in a task list page also cause performance degreedation if tasks list is huge.
-* DONE Changes of synced Logseq tasks should be pushed to Google Tasks as well.
-    * Happens on full synchoronization.
-    * Compare the recorded update timestamp, only update Google Tasks if the timestamp is same.
-    * if local update is bigger than the remote, it should be updated.
-        * DAMN, Logseq doesn't record updated time on block level reliably.
-    * Compare the local is same as remote, content wise.
-        * Task title / Deadline / Status
-      * Also update remote compeleting date.
-      * Make sure the updated time stamp is same after push to remote.
-* DONE Warn if the access token is expired.
-* DONE Show settings UI upon token expiration.
-* TODO Add a Block context action to update/push a single task.
-* TODO For completed Google Tasks, there is a possibility that compelition time could potentially earlier than due and updated.
-* TODO Introduce a force sync command. Currently, if recorded updated time is the same, no update will happen.
-* TODO Handle parent relationship upon task creation.
-* TODO Handle repeat of the deadline upon task creation.
-* TODO Map Google Task List to more Logseq custom pages.
-* TODO Record the last sync time, and use updateMin to only tasks changed since last sync.
-* TODO Sync locally created Logseq task to Google Tasks somehow.
-* TODO Deletion in Google Tasks should be reflected in Logseq.
-    * As the sync is pulling, this is hard to implement.
-    * Consier to have a separate house keeping command maybe.
-* TODO Deletion in Logseq should be reflected in Google Tasks.
-    * Map Logseq CANCEL status Google Task 'hidden' attribute, but doesn't really delete it?
-    * If a task is deleted in Logseq, it should be deleted in Google tasks?? Pop up a confirmation?
-* TODO Add a nice progress bar to show the synchoronization status.
-* TODO Implement Google OAuth2 in a better streamline manner.
-* DONE How updated works in Gtasks api, automated?
-    * Looks like it is
-* TODO Add test coverage to make sure stable iteration.
-* TODO Lockin the current Graph
-* TODO Support Multiple Google Accounts
-* TODO Record the google account at task level
-* TODO Idenfity patched Logseq, for standard Logseq, it should function as is
+- **Toolbar:** Click the Google Tasks icon to sync immediately.
+- **Command Palette:** `Cmd + Shift + P` -> `Google Tasks: Synchronize Now`. `Cmd + Shift + P` -> `Google Tasks: Open Settings` to open the settings page.
+- **Background:** Enable "Enable Automatic Background Sync" in settings for a hands-off experience. Interval is configurable in preferences.
+- **Bidirectional Sync:** Changes in Logseq are pushed to Google Tasks, and changes in Google Tasks are pulled into Logseq. I liked differentiating between tasks originating from Logseq and Google Tasks, so I add a "Logseq Tasks" list in Google Tasks to store tasks originating from Logseq. Name is configurable in preferences, or you can set it to `@default` to use the default list name.
