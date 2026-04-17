@@ -2,7 +2,7 @@ const fs = require('fs');
 const readline = require('readline');
 
 // Read the credentials from your secrets folder
-const credsRaw = fs.readFileSync('./secrets/client_secret_884264005414-661ihl35l2gm48cljv41gcujj4g5t5nb.apps.googleusercontent.com.json', 'utf-8');
+const credsRaw = fs.readFileSync('./secrets/credentials.json', 'utf-8');
 const creds = JSON.parse(credsRaw).installed;
 
 const CLIENT_ID = creds.client_id;
