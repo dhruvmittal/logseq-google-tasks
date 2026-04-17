@@ -20,13 +20,8 @@ async function authGapi() {
     return;
   }
 
-  let scope = "openid profile email https://www.googleapis.com/auth/tasks";
-
-  await logseq.App.invokeGoogleAuth(
-    logseq.settings!.client_id as string,
-    logseq.settings!.client_secret as string,
-    scope
-  );
+  logseq.UI.showMsg("Standard Logseq builds do not natively support Google OAuth prompts. Please generate a Refresh Token manually and paste it into the plugin settings.", 'error');
+  logseq.showSettingsUI();
 }
 
 async function initGapi() {
@@ -60,8 +55,9 @@ async function initGapi() {
       'maxResults': 100,
     });
   }
-  catch (error: HttpError) {
-    if (error.status === 401) {
+  catch (error: any) {
+    let httpError = error as HttpError;
+    if (httpError.status === 401) {
       return false;
     }
   }
@@ -108,14 +104,41 @@ export async function handleSync(progressCallback: (progress: number) => void, p
       console.error(`#${pluginId}: ` + 'Access token expired, attempting to refresh token');
       logseq.UI.showMsg("Google Tasks Access token expired, attempting to refresh token", 'warning');
 
-      await logseq.App.refreshGoogleAuth(
-        logseq.settings!.client_id as string,
-        logseq.settings!.client_secret as string,
-        logseq.settings!.refresh_token as string
-      );
+      try {
+        const response = await fetch('https://oauth2.googleapis.com/token', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+          body: new URLSearchParams({
+            client_id: logseq.settings!.client_id as string,
+            client_secret: logseq.settings!.client_secret as string,
+            refresh_token: logseq.settings!.refresh_token as string,
+            grant_type: 'refresh_token',
+          }),
+        });
 
-      // sleep for a while to wait for the token to be updated
-      await new Promise(resolve => setTimeout(resolve, 1000));
+        if (!response.ok) {
+          throw new Error(`Refresh token failed: ${response.statusText}`);
+        }
+
+        const data = await response.json();
+
+        if (data.access_token) {
+          logseq.updateSettings({ access_token: data.access_token });
+          // Directly inject into gapi to allow the immediate subsequent request to succeed
+          let token = JSON.parse('{"access_token":"' + data.access_token + '"}');
+          gapi.client.setToken(token);
+        } else {
+          throw new Error('No access token in refresh response');
+        }
+      } catch (e: any) {
+        console.error(`#${pluginId}: Error automatically refreshing Google Tasks token:`, e);
+        logseq.UI.showMsg("Failed to automatically refresh Google Tasks token. Please check your credentials in settings.", 'error');
+        logseq.showSettingsUI();
+        setIsSyncing(false);
+        return;
+      }
     }
   }
 

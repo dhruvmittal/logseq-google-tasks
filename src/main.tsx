@@ -55,7 +55,7 @@ function main() {
   `,
   });
 
-  logseq.App.onGoogleAuthTokenReceived((payload) => {
+  ;(logseq.App as any).onGoogleAuthTokenReceived((payload: any) => {
     console.info(`#${pluginId}: ` + "Google Auth Token Received");
     console.debug(payload);
 
