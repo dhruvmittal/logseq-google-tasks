@@ -5,15 +5,22 @@ export default function settingSchema() {
     {
       key: "client_id",
       type: "string",
-      title: "Client ID",
-      description: "",
+      title: "Google API Client ID",
+      description: "Get this from Google Cloud Console. Once you have both Client ID and Secret entered, run 'Google Tasks: Start Authentication' from the Logseq Command Palette.",
       default: "",
     },
     {
       key: "client_secret",
       type: "string",
-      title: "Client Secret",
+      title: "Google API Client Secret",
       description: "",
+      default: "",
+    },
+    {
+      key: "auth_code",
+      type: "string",
+      title: "Paste Auth Redirect URL Here",
+      description: "After running 'Google Tasks: Start Authentication' and logging into Google, you will be redirected to an error page on 'localhost'. Copy the ENTIRE URL from your browser address bar and paste it here.",
       default: "",
     },
     {
