@@ -58,6 +58,34 @@ function main() {
     }
   );
 
+  logseq.App.registerCommandPalette(
+    {
+      key: "start-authentication",
+      label: "Google Tasks: Start Authentication",
+    },
+    async () => {
+      const clientId = logseq.settings?.client_id;
+      if (!clientId) {
+        logseq.UI.showMsg("Please enter your Google API Client ID in the settings first.", "error");
+        logseq.showSettingsUI();
+        return;
+      }
+      
+      const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?` +
+        `scope=openid%20profile%20email%20https%3A//www.googleapis.com/auth/tasks&` +
+        `access_type=offline&` +
+        `include_granted_scopes=true&` +
+        `response_type=code&` +
+        `redirect_uri=http://localhost&` +
+        `client_id=${encodeURIComponent(clientId.toString())}&` + 
+        `prompt=consent`;
+
+      logseq.App.openExternalLink(authUrl);
+      logseq.UI.showMsg("Opening browser! Log in, then paste the localhost URL back into the plugin settings.", "info");
+      logseq.showSettingsUI();
+    }
+  );
+
   // Background sync daemon Let's use setInterval
   let syncInterval: ReturnType<typeof setInterval> | null = null;
   const startAutoSync = () => {
@@ -82,8 +110,45 @@ function main() {
     },
   });
 
-  logseq.onSettingsChanged(() => {
+  logseq.onSettingsChanged(async () => {
     startAutoSync();
+
+    const authCode = logseq.settings?.auth_code as string | undefined;
+    if (authCode && authCode.includes("code=")) {
+      try {
+        const url = new URL(authCode);
+        const code = url.searchParams.get('code');
+        if (code) {
+          logseq.UI.showMsg("Exchanging auth code for tokens...", "info");
+          const response = await fetch('https://oauth2.googleapis.com/token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
+              code: code,
+              client_id: logseq.settings?.client_id as string,
+              client_secret: logseq.settings?.client_secret as string,
+              redirect_uri: 'http://localhost',
+              grant_type: 'authorization_code'
+            })
+          });
+          const data = await response.json();
+          if (data.refresh_token) {
+            logseq.updateSettings({
+              refresh_token: data.refresh_token,
+              access_token: data.access_token,
+              auth_code: "" // clean up the pasted url
+            });
+            logseq.UI.showMsg("Google Tasks Authentication successful! Refresh token saved.", "success");
+          } else {
+            console.error("Token exchange failed", data);
+            logseq.UI.showMsg("Failed to exchange code for token. Check Developer Tools Console.", "error");
+          }
+        }
+      } catch (e) {
+        console.error("Failed to parse auth code URL", e);
+        logseq.UI.showMsg("Invalid Redirect URL format pasted.", "error");
+      }
+    }
   });
   
   startAutoSync();
