@@ -24,42 +24,88 @@ async function authGapi() {
   logseq.showSettingsUI();
 }
 
+export async function purgeLocalTasks() {
+  const query = `
+    [:find (pull ?b [*])
+     :where
+     (or 
+       [?b :plugin.property._test_plugin/google-task-id]
+       [?b :plugin.property.logseq-google-tasks/google-task-id]
+       [?b :logseq.property/google-task-id]
+     )
+    ]
+  `;
+  const results = await logseq.DB.datascriptQuery(query);
+  const blocks = results?.map((r: any) => {
+    const b = r[0];
+    if (b && typeof b.uuid === 'object' && b.uuid.$uuid$) b.uuid = b.uuid.$uuid$;
+    if (b && !b.properties) {
+      b.properties = {};
+      for (const k of Object.keys(b)) {
+        if (typeof k === 'string' && k.includes('/')) b.properties[k] = b[k];
+      }
+    }
+    return b;
+  }) || [];
+
+  const total = blocks.length;
+  console.info(`#${pluginId}: Found ${total} blocks to purge.`);
+  
+  if (total === 0) {
+    logseq.UI.showMsg("Found 0 blocks to purge.", 'info');
+    return;
+  }
+
+  let currentToastKey = '';
+  for (let i = 0; i < total; i++) {
+    const block = blocks[i];
+    await logseq.Editor.removeBlock(block.uuid);
+    
+    if (i % 10 === 0 || i === total - 1) {
+      const pct = ((i + 1) / total) * 100;
+      const filledLength = Math.round((pct / 100) * 10);
+      const bar = `[${'█'.repeat(filledLength)}${'░'.repeat(10 - filledLength)}]`;
+      const fullMsg = `${bar} ${Math.round(pct)}% - Purging ${i + 1} of ${total}`;
+      
+      if (currentToastKey) {
+        await logseq.UI.showMsg(fullMsg, 'info', { key: currentToastKey, timeout: 5000 });
+      } else {
+        currentToastKey = await logseq.UI.showMsg(fullMsg, 'info', { timeout: 5000 });
+      }
+    }
+  }
+  
+  if (currentToastKey) {
+    await logseq.UI.showMsg(`Successfully purged ${total} legacy tasks!`, 'success', { key: currentToastKey, timeout: 3000 });
+  }
+}
+
 async function initGapi() {
-  console.info(`#${pluginId}: ` + "Init GAPI");
+  console.info(`#${pluginId}: ` + "Init GAPI (Native Fetch)");
 
-  console.debug(gapi);
-
-  await new Promise(resolve => {
-    gapi.load('client', resolve);
-  });
-
-  console.debug(gapi.client);
-
-  // As long as we have refresh token, we can accept empty access token
-  //if (!logseq.settings!.access_token) {
-  //  throw new Error("Access token is not set.");
-  //}
-
-  let token = JSON.parse('{"access_token":"' + logseq.settings!.access_token + '"}');
-  gapi.client.setToken(token);
-
-  await new Promise(resolve => {
-    gapi.client.init({
-      discoveryDocs: ['https://www.googleapis.com/discovery/v1/apis/tasks/v1/rest'],
-    }).then(resolve);
-  });
+  if (!logseq.settings!.access_token) {
+    return false;
+  }
 
   try {
-    // Make a request to tasks list to check if token is still valid
-    await gapi.client.tasks.tasklists.list({
-      'maxResults': 100,
+    const response = await fetch('https://tasks.googleapis.com/tasks/v1/users/@me/lists?maxResults=1', {
+      headers: {
+        'Authorization': `Bearer ${logseq.settings!.access_token}`,
+        'Content-Type': 'application/json'
+      }
     });
-  }
-  catch (error: any) {
-    let httpError = error as HttpError;
-    if (httpError.status === 401) {
+    
+    if (response.status === 401) {
       return false;
     }
+    
+    if (!response.ok) {
+      console.warn("Tasks API returned status:", response.statusText);
+      return false;
+    }
+  } catch (error: any) {
+    console.error("Init Error", error);
+    return false;
   }
 
   return true;
@@ -129,8 +175,7 @@ export async function handleSync(isAutoSync: boolean = false) {
 
         if (data.access_token) {
           logseq.updateSettings({ access_token: data.access_token });
-          let token = JSON.parse('{"access_token":"' + data.access_token + '"}');
-          gapi.client.setToken(token);
+          logseq.settings!.access_token = data.access_token;
         } else {
           throw new Error('No access token in refresh response');
         }
@@ -161,8 +206,125 @@ export async function handleSync(isAutoSync: boolean = false) {
     await showProgress("Pushing local TODOs to Google...", 10);
     await pushNativeTodosToGoogle();
     
-    const tokenToUse = isAutoSync ? lastSyncTime : null;
-    await syncGoogleTasks(isAutoSync, showProgress, tokenToUse);
+    // Pre-fetch all local Google tasks for fast O(1) lookup
+    let allLocalGTasks: any[] = [];
+    const query = `
+      [:find (pull ?b [*])
+       :where
+       (or 
+         [?b :plugin.property._test_plugin/google-task-id]
+         [?b :plugin.property.logseq-google-tasks/google-task-id]
+         [?b :logseq.property/google-task-id]
+       )
+      ]
+    `;
+    const res = await logseq.DB.datascriptQuery(query);
+    allLocalGTasks = res?.map((r: any) => {
+      const b = r[0];
+      if (b && typeof b.uuid === 'object' && b.uuid.$uuid$) b.uuid = b.uuid.$uuid$;
+      return b;
+    }) || [];
+
+    // Build dedup map by directly querying DataScript for resolved string values
+    // The SDK returns property values as {:db/id N} references, but DataScript
+    // can resolve the actual string through the property-value entity's :block/title
+    const localTasksByGid = new Map<string, any>();
+    const gidQuery = `
+      [:find ?uuid ?gid
+       :where
+       (or
+         [?b :plugin.property.logseq-google-tasks/google-task-id ?pv]
+         [?b :plugin.property._test_plugin/google-task-id ?pv]
+       )
+       [?b :block/uuid ?uuid]
+       [?pv :block/title ?gid]
+      ]
+    `;
+    try {
+      const gidRes = await logseq.DB.datascriptQuery(gidQuery);
+      if (gidRes) {
+        for (const row of gidRes) {
+          let uuid = row[0];
+          const gid = row[1];
+          if (uuid && typeof uuid === 'object' && uuid.$uuid$) uuid = uuid.$uuid$;
+          if (typeof gid === 'string' && gid.length > 0) {
+            const block = allLocalGTasks.find((b: any) => b.uuid === uuid);
+            if (block) {
+              localTasksByGid.set(gid, block);
+            }
+          }
+        }
+      }
+      console.info(`#${pluginId}: Built dedup map with ${localTasksByGid.size} entries from ${allLocalGTasks.length} local blocks.`);
+    } catch (e) {
+      console.error(`#${pluginId}: GID DataScript query failed, trying :property.value/content fallback...`, e);
+      // Fallback: try :property.value/content instead of :block/title
+      try {
+        const gidRes2 = await logseq.DB.datascriptQuery(`
+          [:find ?uuid ?gid
+           :where
+           (or
+             [?b :plugin.property.logseq-google-tasks/google-task-id ?pv]
+             [?b :plugin.property._test_plugin/google-task-id ?pv]
+           )
+           [?b :block/uuid ?uuid]
+           [?pv :property.value/content ?gid]
+          ]
+        `);
+        if (gidRes2) {
+          for (const row of gidRes2) {
+            let uuid = row[0];
+            const gid = row[1];
+            if (uuid && typeof uuid === 'object' && uuid.$uuid$) uuid = uuid.$uuid$;
+            if (typeof gid === 'string' && gid.length > 0) {
+              const block = allLocalGTasks.find((b: any) => b.uuid === uuid);
+              if (block) localTasksByGid.set(gid, block);
+            }
+          }
+        }
+        console.info(`#${pluginId}: Fallback dedup map with ${localTasksByGid.size} entries.`);
+      } catch (e2) {
+        console.error(`#${pluginId}: Both GID queries failed!`, e2);
+      }
+    }
+    // Also build a map of resolved google-task-updated timestamps
+    const localUpdatedByGid = new Map<string, string>();
+    try {
+      const updQuery = `
+        [:find ?gid-str ?upd-str
+         :where
+         (or
+           [?b :plugin.property.logseq-google-tasks/google-task-id ?gid-pv]
+           [?b :plugin.property._test_plugin/google-task-id ?gid-pv]
+         )
+         [?gid-pv :block/title ?gid-str]
+         (or
+           [?b :plugin.property.logseq-google-tasks/google-task-updated ?upd-pv]
+           [?b :plugin.property._test_plugin/google-task-updated ?upd-pv]
+         )
+         [?upd-pv :block/title ?upd-str]
+        ]
+      `;
+      const updRes = await logseq.DB.datascriptQuery(updQuery);
+      if (updRes) {
+        for (const row of updRes) {
+          if (typeof row[0] === 'string' && typeof row[1] === 'string') {
+            localUpdatedByGid.set(row[0], row[1]);
+          }
+        }
+      }
+      console.info(`#${pluginId}: Built updated-timestamp map with ${localUpdatedByGid.size} entries.`);
+    } catch (e) {
+      console.warn(`#${pluginId}: Could not build updated-timestamp map, will update all tasks.`, e);
+    }
+    
+    let taskLists = await fetchTaskLists() ?? [];
+    for (const list of taskLists) {
+      const tasks = await fetchTasks(list.id as string, null);
+      if (tasks) {
+        await syncGoogleTasks(list, tasks, localTasksByGid, localUpdatedByGid, isAutoSync, showProgress);
+      }
+    }
     
     lastSyncTime = new Date().toISOString();
     
@@ -188,96 +350,83 @@ export async function handleSync(isAutoSync: boolean = false) {
   }
 }
 
-async function syncGoogleTasks(isAutoSync: boolean, showProgress: (msg: string, pct: number) => Promise<void>, updatedMin: string | null) {
+async function syncGoogleTasks(list: any, tasks: any[], localTasksByGid: Map<string, any>, localUpdatedByGid: Map<string, string>, isAutoSync: boolean, showProgress: (msg: string, pct: number) => Promise<void>) {
   console.info(`#${pluginId}: ` + "Start Syncing Google Tasks");
 
-  let taskLists = await fetchTaskLists() ?? [];
+  let tasksNew: { [key: string]: any[] } = {};
 
-  let tasksArray = (await Promise.all(taskLists.map(
-    async (taskList: any) => {
-      let tasks = await fetchTasks(taskList.id, updatedMin) ?? [];
-
-      return tasks.map((task: any) => {
-        return [taskList, task];
-      });
-    }
-  ))).flat();
-
-  await showProgress("Fetching task lists...", 20);
-
-  let tasksNew: { [key: string]: any[] } = {}
-
-  let totalTasks = tasksArray.length;
+  let totalTasks = tasks.length;
   let currentTask = 0;
+  let skipped = 0;
 
-  for (let taskArray of tasksArray) {
+  for (const task of tasks) {
     currentTask++;
     await showProgress(`Parsing task ${currentTask} of ${totalTasks}`, 20 + Math.round(60 * currentTask / (totalTasks || 1)));
-    console.debug(`#${pluginId}: ` + `Syncing task ${currentTask} of ${totalTasks}`);
-
-    let [list, task] = taskArray as [any, any];
-
-    let res = await logseq.DB.q(`(property :google-task-id "${task.id}")`);
+    
+    let res: any[] = [];
+    if (localTasksByGid && localTasksByGid.has(task.id)) {
+      res = [localTasksByGid.get(task.id)];
+    }
 
     if (res && res.length > 1) {
       console.warn(`#${pluginId}: ` + `Multiple tasks with the same id found: ${task.id}`);
     }
 
     if (res && res.length > 0) {
-      if (res[0].properties["googleTaskUpdated"] === task.updated) {
-        // Here we only try to update GTasks if updated time is the same
-        // If GTasks is newer, and there is also local changes, local changes
-        // will be discarded as Logseq currently doesn't recored change date
-        // on block level reliably.
-        pushLocalChanges(res[0], task);
+      // Use the pre-resolved updated timestamp from DataScript
+      const localUpdated = localUpdatedByGid.get(task.id);
+      if (localUpdated && localUpdated === task.updated) {
+        // Timestamps match on Google side, but user may have changed status locally
+        await pushLocalChanges(res[0], task);
+        skipped++;
         continue;
       }
 
-      updateTaskBlock(res[0], list, task);
+      console.debug(`#${pluginId}: Update block: ${res[0].uuid} with task: ${task.id} : ${task.title}`);
+      await updateTaskBlock(res[0], list, task);
+      
+      // Throttle: pause briefly every 10 updates to let the IPC bridge breathe
+      if (currentTask % 10 === 0) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
     }
     else {
       // When a task is deleted in Google Tasks, the task is marked as deleted
       // and hidden from UI, then it is deleted asynchronously later.
-      if (task.deleted) {
-        continue;
-      }
-
+      if (task.deleted) continue;
+      
       console.info(`#${pluginId}: ` + `Insert block for task: ${task.id}`);
-
       let parentName = await generateParentName(list, task);
 
       tasksNew[parentName] = tasksNew[parentName] || [];
-      tasksNew[parentName].push([list, task])
+      tasksNew[parentName].push([list, task]);
     }
   }
 
   await showProgress("Inserting tasks to Logseq...", 90);
 
-  for (let [parentName, tasks] of Object.entries(tasksNew)) {
+  for (let [parentName, groupTasks] of Object.entries(tasksNew)) {
     let pageEntity = await ensurePage(parentName, false);
-    console.debug(pageEntity);
     if (!pageEntity) {
       throw new Error(`Unable to create parent page ${parentName}`);
     }
 
     let pageBlocksTree = await logseq.Editor.getPageBlocksTree(pageEntity.uuid);
-    console.debug(pageBlocksTree);
-
-    // A better way to handle target block, even if for new page
-    let targetBlock = pageBlocksTree[pageBlocksTree.length - 1];
+    let targetBlock = pageBlocksTree && pageBlocksTree.length > 0 ? pageBlocksTree[pageBlocksTree.length - 1] : null;
     
-    let generatedTasks = await Promise.all(tasks.map(async ([list, task]) => {
+    let generatedTasks = await Promise.all(groupTasks.map(async ([list, task]: any[]) => {
       return await blockContentGenerate(list, task);
     }));
 
     if (!targetBlock) {
-      // Empty page, bootstrap with first block then batch others
       const firstTask = generatedTasks[0];
       const createdBlock = await logseq.Editor.appendBlockInPage(pageEntity.uuid, firstTask.content, { properties: firstTask.properties });
       
       if (createdBlock) {
-        if (generatedTasks.length > 1) {
-          await logseq.Editor.insertBatchBlock(createdBlock.uuid, generatedTasks.slice(1));
+        let remaining = generatedTasks.slice(1);
+        while (remaining.length > 0) {
+          await logseq.Editor.insertBatchBlock(createdBlock.uuid, remaining.slice(0, 100), { sibling: true });
+          remaining = remaining.slice(100);
         }
         
         if (firstTask.children && firstTask.children.length > 0) {
@@ -285,8 +434,12 @@ async function syncGoogleTasks(isAutoSync: boolean, showProgress: (msg: string, 
         }
       }
     } else {
-      console.debug(targetBlock);
-      logseq.Editor.insertBatchBlock(targetBlock.uuid, generatedTasks);
+      let remaining = generatedTasks;
+      let refUuid = targetBlock.uuid;
+      while (remaining.length > 0) {
+        await logseq.Editor.insertBatchBlock(refUuid, remaining.slice(0, 100), { sibling: true });
+        remaining = remaining.slice(100);
+      }
     }
   }
 
@@ -308,10 +461,20 @@ async function pushNativeTodosToGoogle() {
         targetList = taskLists.find(l => l.id === "@default");
     } else {
         console.info(`#${pluginId}: Creating new task list: ${targetListName}`);
-        const response = await gapi.client.tasks.tasklists.insert({
-          resource: { title: targetListName }
+        const response = await fetch('https://tasks.googleapis.com/tasks/v1/users/@me/lists', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${logseq.settings!.access_token}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ title: targetListName })
         });
-        targetList = response.result;
+        if (!response.ok) {
+          const e = new Error(`Failed to create list: ${response.statusText}`) as HttpError;
+          e.status = response.status;
+          throw e;
+        }
+        targetList = await response.json();
     }
   }
 
@@ -319,45 +482,81 @@ async function pushNativeTodosToGoogle() {
       throw new Error(`Could not find or create target list: ${targetListName}`);
   }
 
-  // 2. Query Logseq for active TODOs without google-task-id
-  const query = `
-    [:find (pull ?b [*])
+  // Use DataScript to find blocks tagged as Task that do NOT have a google-task-id,
+  // and resolve their status string properly
+  const pushQuery = `
+    [:find ?uuid ?status-str
      :where
-     [?b :block/marker ?marker]
-     [(contains? #{"TODO" "DOING" "NOW" "LATER" "WAITING"} ?marker)]
-     (not [?b :block/properties ?props]
-          [(get ?props :google-task-id)])]
+     [?b :block/tags ?tag]
+     [?tag :block/name "task"]
+     [?b :block/uuid ?uuid]
+     [?b :logseq.property/status ?status-entity]
+     [?status-entity :block/title ?status-str]
+     (not [?b :plugin.property.logseq-google-tasks/google-task-id _])
+     (not [?b :plugin.property._test_plugin/google-task-id _])
+    ]
   `;
   
-  const results = await logseq.DB.datascriptQuery(query);
-  const blocks = results?.map((r: any) => r[0]) || [];
+  let blocksToPush: any[] = [];
+  try {
+    const pushRes = await logseq.DB.datascriptQuery(pushQuery);
+    if (pushRes) {
+      for (const row of pushRes) {
+        let uuid = row[0];
+        const statusStr = row[1];
+        if (uuid && typeof uuid === 'object' && uuid.$uuid$) uuid = uuid.$uuid$;
+        
+        const status = (typeof statusStr === 'string' ? statusStr : '').toLowerCase();
+        const isAction = ['todo', 'doing', 'now', 'later', 'waiting'].includes(status);
+        
+        if (isAction) {
+          const sdkBlock = await logseq.Editor.getBlock(uuid);
+          if (sdkBlock) blocksToPush.push(sdkBlock);
+        }
+      }
+    }
+  } catch (e) {
+    console.error(`#${pluginId}: Push query failed`, e);
+  }
 
-  if (blocks.length === 0) {
+  if (blocksToPush.length === 0) {
     console.info(`#${pluginId}: No new local TODOs to sync.`);
     return;
   }
 
-  console.info(`#${pluginId}: Pushing ${blocks.length} local TODOs to Google Tasks.`);
+  console.info(`#${pluginId}: Pushing ${blocksToPush.length} local TODOs to Google Tasks.`);
   
-  for (const block of blocks) {
+  for (const block of blocksToPush) {
     try {
-      let taskTitle = block.content
-        .replace(/^(DONE|TODO|DOING|NOW|LATER|WAITING)? /, '')
+      let taskTitle = (block.content || "")
         .replace(/\nDEADLINE: [^\n]*/g, '')
         .replace(/\n[^\n]*:: [^\n]*/g, '')
-        .replace(/^[^\n]*:: [^\n]*\n/g, '');
+        .replace(/^[^\n]*:: [^\n]*\n/g, '')
+        .replace(/#Task/ig, '')
+        .trim();
+
+      const localStatus = (block.properties?.status || block.properties?.["logseq.property/status"] || "").toLowerCase();
+      const isCompleted = localStatus === "done" || localStatus === "canceled" || localStatus === "cancelled";
 
       const newTask = {
         title: taskTitle || "Unnamed Task",
-        status: (block.marker === 'DONE' || block.marker === 'CANCELLED') ? 'completed' : 'needsAction'
+        status: isCompleted ? 'completed' : 'needsAction'
       };
 
-      const response = await gapi.client.tasks.tasks.insert({
-        tasklist: targetList.id,
-        resource: newTask
+      const response = await fetch(`https://tasks.googleapis.com/tasks/v1/lists/${targetList.id}/tasks`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${logseq.settings!.access_token}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(newTask)
       });
-
-      const googleTask = response.result;
+      if (!response.ok) {
+        const e = new Error(`Failed to create task: ${response.statusText}`) as HttpError;
+        e.status = response.status;
+        throw e;
+      }
+      const googleTask = await response.json();
 
       // Update Logseq block with the new IDs
       await logseq.Editor.upsertBlockProperty(block.uuid, "google-task-id", googleTask.id);
@@ -379,14 +578,23 @@ async function fetchTaskLists(): Promise<gapi.client.tasks.TaskList[] | undefine
   let taskLists: any[] = [];
   let nextPageToken;
   do {
-    let response: any = await gapi.client.tasks.tasklists.list({
-      'maxResults': 100,
-      'pageToken': nextPageToken
-    });
-    console.debug(response.result);
+    const url = new URL('https://tasks.googleapis.com/tasks/v1/users/@me/lists');
+    url.searchParams.append('maxResults', '100');
+    if (nextPageToken) url.searchParams.append('pageToken', nextPageToken);
 
-    taskLists = taskLists.concat(response.result.items);
-    nextPageToken = response.result.nextPageToken;
+    const response = await fetch(url.toString(), {
+      headers: { 'Authorization': `Bearer ${logseq.settings!.access_token}` }
+    });
+    if (!response.ok) {
+      const e = new Error(`Failed to fetch task lists: ${response.statusText}`) as HttpError;
+      e.status = response.status;
+      throw e;
+    }
+    const data = await response.json();
+
+    console.debug(data);
+    if (data.items) taskLists = taskLists.concat(data.items);
+    nextPageToken = data.nextPageToken;
   } while (nextPageToken);
 
   if (!taskLists || taskLists.length == 0) {
@@ -406,26 +614,28 @@ async function fetchTasks(taskListId: string, updatedMin: string | null): Promis
   let tasks: any[] = [];
   let nextPageToken;
   do {
-    // Workaround for bug https://issuetracker.google.com/issues/168580260,
-    // that update individual task does not update the etag of the task list
-    // so the list request will return cached/stalled data.
-    //let response: any = await gapi.client.tasks.tasks.list({
-    let url = `https://tasks.googleapis.com/tasks/v1/lists/${taskListId}/tasks?cacheBuster=${Date.now()}`;
-    let response: any = await gapi.client.request({
-      path: url,
-      method: 'GET',
-      params: {
-        'tasklist': taskListId,
-        'pageToken': nextPageToken,
-        'maxResults': 100,
-        'showHidden': true,
-        'showDeleted': true,
-        'showCompleted': true,
-      }
+    const url = new URL(`https://tasks.googleapis.com/tasks/v1/lists/${taskListId}/tasks`);
+    url.searchParams.append('maxResults', '100');
+    url.searchParams.append('showHidden', 'true');
+    url.searchParams.append('showDeleted', 'true');
+    url.searchParams.append('showCompleted', 'true');
+    url.searchParams.append('cacheBuster', Date.now().toString());
+    if (updatedMin) url.searchParams.append('updatedMin', updatedMin);
+    if (nextPageToken) url.searchParams.append('pageToken', nextPageToken);
+
+    const response = await fetch(url.toString(), {
+      headers: { 'Authorization': `Bearer ${logseq.settings!.access_token}` }
     });
-    console.debug(response.result);
-    tasks = tasks.concat(response.result.items);
-    nextPageToken = response.result.nextPageToken;
+    if (!response.ok) {
+      const e = new Error(`Failed to fetch tasks: ${response.statusText}`) as HttpError;
+      e.status = response.status;
+      throw e;
+    }
+    const data = await response.json();
+
+    console.debug(data);
+    if (data.items) tasks = tasks.concat(data.items);
+    nextPageToken = data.nextPageToken;
   } while (nextPageToken);
 
   if (!tasks || tasks.length == 0) {
@@ -468,7 +678,10 @@ async function updateTaskBlock(block: BlockEntity, list: gapi.client.tasks.TaskL
 
   // Get list object if list is a string
   if (typeof list === 'string') {
-    list = (await gapi.client.tasks.tasklists.get({ tasklist: list })).result as gapi.client.tasks.Task;
+    const res = await fetch(`https://tasks.googleapis.com/tasks/v1/users/@me/lists/${list}`, {
+      headers: { 'Authorization': `Bearer ${logseq.settings!.access_token}` }
+    });
+    list = await res.json() as gapi.client.tasks.Task;
   }
 
   let blockNew = await blockContentGenerate(list, task);
@@ -526,40 +739,29 @@ async function blockContentGenerate(list: gapi.client.tasks.TaskList, task: gapi
   const { preferredDateFormat, preferredTodo } = await logseq.App.getUserConfigs();
 
   let title = task.title;
-  switch (task.status) {
-    default:
-    case 'needsAction':
-      title = `${preferredTodo} ${title}`;
-      break;
-    case 'completed':
-      title = `DONE ${title}`;
-      break;
-  }
 
   // Create a block for the task title
   const taskBlock: IBatchBlock = {
-    content: `${title}`,
+    content: `${title} #Task`,
   };
 
   taskBlock.properties = {};
+  taskBlock.properties["logseq.property/status"] = task.status === 'completed' ? 'Done' : 'Todo';
   taskBlock.properties["google-task-id"] = task.id;
   taskBlock.properties["google-task-list-id"] = list.id;
   taskBlock.properties["google-task-list-ref"] = `[[GTasks/${list.title}]]`;
   taskBlock.properties["google-task-updated"] = task.updated;
   taskBlock.properties["google-task-webViewLink"] = task.webViewLink;
-  if (task.hidden && task.status !== 'completed') {
+  if (task.hidden) {
     taskBlock.properties["google-task-hidden"] = task.hidden;
   }
   if (task.deleted) {
     taskBlock.properties["google-task-deleted"] = task.deleted;
   }
 
-  let taskCompletedDate: string | undefined;
-  if (task.completed) {
-    taskCompletedDate = format(
-      new Date(task.completed),
-      preferredDateFormat,
-    );
+  // add completion date to Logseq
+  if (logseq.settings?.addCompletionDate && task.completed) {
+    const taskCompletedDate = format(new Date(task.completed), preferredDateFormat);
     taskBlock.properties["completed"] = `[[${taskCompletedDate}]]`;
   }
 
@@ -568,7 +770,7 @@ async function blockContentGenerate(list: gapi.client.tasks.TaskList, task: gapi
     const notesBlock: IBatchBlock = {
       content: task.notes || '',
       properties: {
-        'google-task-context': 'notes',
+        "google-task-context": "notes",
       },
       children: [],
     };
@@ -583,7 +785,7 @@ async function blockContentGenerate(list: gapi.client.tasks.TaskList, task: gapi
     const linksBlock: IBatchBlock = {
       content: `\`\`\`\n${JSON.stringify(task.links, null, 2)}\n\`\`\``,
       properties: {
-        'google-task-context': 'links',
+        "google-task-context": "links",
       },
       children: [],
     };
@@ -632,23 +834,42 @@ async function pushLocalChanges(block: BlockEntity, task: gapi.client.tasks.Task
 
   let needsUpdate = false;
   let taskNew = { ...task };
-  let taskTitle = block.content
-    .replace(/^(DONE|TODO|DOING|NOW|LATER|WAITING)? /, '')
+  let taskTitle = (block.content || "")
     .replace(/\nDEADLINE: [^\n]*/g, '')
     .replace(/\n[^\n]*:: [^\n]*/g, '')
-    .replace(/^[^\n]*:: [^\n]*\n/g, '');
-  if (taskTitle.trim() !== task.title?.trim()) {
-    console.debug(taskTitle);
-    console.debug(task.title);
+    .replace(/^[^\n]*:: [^\n]*\n/g, '')
+    .replace(/#\[\[.*?\]\]/g, '') // Strip Logseq DB 2.0 internal UUID tag refs
+    .replace(/#[^\s]+/g, '')      // Strip normal tags like #Task
+    .trim();
+    
+  if (taskTitle !== task.title?.trim()) {
+    console.debug(`Title changed locally. Old: "${task.title}", New: "${taskTitle}"`);
     taskNew.title = taskTitle;
     needsUpdate = true;
   }
 
-  // Handle status update
-  const completedMarkers = ['DONE', 'CANCELLED'];
-  const actionMarkers = ['TODO', 'DOING', 'NOW', 'LATER', 'WAITING'];
+  // Handle status update — resolve via DataScript since SDK returns {:db/id N}
+  let localStatus = '';
+  try {
+    const statusQuery = `
+      [:find ?status-str
+       :where
+       [?b :block/uuid #uuid "${block.uuid}"]
+       [?b :logseq.property/status ?sv]
+       [?sv :block/title ?status-str]
+      ]
+    `;
+    const statusRes = await logseq.DB.datascriptQuery(statusQuery);
+    if (statusRes && statusRes.length > 0) {
+      localStatus = (statusRes[0][0] || '').toLowerCase();
+    }
+  } catch (e) {
+    console.warn(`#${pluginId}: Could not resolve status for block ${block.uuid}`, e);
+  }
+  const completedMarkers = ['done', 'cancelled', 'canceled'];
+  const actionMarkers = ['todo', 'doing', 'now', 'later', 'waiting'];
 
-  if (completedMarkers.includes(block.marker || '') && task.status === 'needsAction') {
+  if (completedMarkers.includes(localStatus) && task.status === 'needsAction') {
     taskNew.status = 'completed';
     // Logseq by default does not have completed date recorded for tasks.
     // This is now a feature provided by a plugin, which links to a jdournal,
@@ -663,7 +884,7 @@ async function pushLocalChanges(block: BlockEntity, task: gapi.client.tasks.Task
     }
     needsUpdate = true;
   }
-  if (actionMarkers.includes(block.marker || '') && task.status === 'completed') {
+  if (actionMarkers.includes(localStatus) && task.status === 'completed') {
     taskNew.status = 'needsAction';
     delete taskNew.completed;
     needsUpdate = true;
@@ -706,21 +927,110 @@ async function pushLocalChanges(block: BlockEntity, task: gapi.client.tasks.Task
     console.debug(block);
     console.debug(taskNew);
 
-    await gapi.client.tasks.tasks.update({
-      tasklist: block.properties?.["googleTaskListId"],
-      task: taskNew.id,
-      resource: taskNew,
+    // Resolve google-task-list-id via DataScript (SDK returns {:db/id N})
+    let taskListId: string | null = null;
+    try {
+      const listIdQuery = `
+        [:find ?lid-str
+         :where
+         [?b :block/uuid #uuid "${block.uuid}"]
+         (or
+           [?b :plugin.property.logseq-google-tasks/google-task-list-id ?pv]
+           [?b :plugin.property._test_plugin/google-task-list-id ?pv]
+         )
+         [?pv :block/title ?lid-str]
+        ]
+      `;
+      const listIdRes = await logseq.DB.datascriptQuery(listIdQuery);
+      if (listIdRes && listIdRes.length > 0) {
+        taskListId = listIdRes[0][0];
+      }
+    } catch (e) {
+      console.error(`#${pluginId}: Could not resolve google-task-list-id for block ${block.uuid}`, e);
+    }
+    
+    if (!taskListId) {
+      console.warn(`#${pluginId}: Missing google-task-list-id property on block ${block.uuid}, skipping.`);
+      return;
+    }
+    const putRes = await fetch(`https://tasks.googleapis.com/tasks/v1/lists/${taskListId}/tasks/${taskNew.id}`, {
+      method: 'PUT',
+      headers: {
+        'Authorization': `Bearer ${logseq.settings!.access_token}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(taskNew)
     });
+    if (!putRes.ok) throw new Error(`Failed to update task: ${putRes.statusText}`);
 
-    let updatedTask = await gapi.client.tasks.tasks.get({
-      tasklist: block.properties?.["googleTaskListId"],
-      task: taskNew.id,
+    const getRes = await fetch(`https://tasks.googleapis.com/tasks/v1/lists/${taskListId}/tasks/${taskNew.id}`, {
+      headers: { 'Authorization': `Bearer ${logseq.settings!.access_token}` }
     });
+    if (!getRes.ok) throw new Error(`Failed to fetch updated task: ${getRes.statusText}`);
+    let updatedTask = await getRes.json();
 
     console.debug(updatedTask);
 
-    updateTaskBlock(block, block.properties?.["googleTaskListId"] as string, updatedTask.result as gapi.client.tasks.Task);
+    updateTaskBlock(block, taskListId as string, updatedTask as gapi.client.tasks.Task);
 
     console.info(`#${pluginId}: ` + `Task ${task.id} has been changed locally`);
+  }
+}
+
+/**
+ * Scans Google Tasks for titles corrupted with Logseq internal refs and fixes them.
+ */
+export async function fixCorruptedTitles() {
+  logseq.UI.showMsg("Scanning Google Tasks for corrupted titles...", "info");
+  
+  const taskLists = await fetchTaskLists();
+  if (!taskLists) {
+    logseq.UI.showMsg("Could not fetch task lists.", "error");
+    return;
+  }
+
+  let fixedCount = 0;
+  for (const list of taskLists) {
+    const tasks = await fetchTasks(list.id as string, null);
+    if (!tasks) continue;
+
+    for (const task of tasks) {
+      if (task.title && task.title.includes('#[[')) {
+        const newTitle = task.title.replace(/#\[\[.*?\]\]/g, '').trim();
+        
+        console.info(`#${pluginId}: Fixing corrupted title: "${task.title}" -> "${newTitle}"`);
+        
+        try {
+          const putRes = await fetch(`https://tasks.googleapis.com/tasks/v1/lists/${list.id}/tasks/${task.id}`, {
+            method: 'PUT',
+            headers: {
+              'Authorization': `Bearer ${logseq.settings!.access_token}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              ...task,
+              title: newTitle
+            })
+          });
+
+          if (putRes.ok) {
+            fixedCount++;
+          } else {
+            console.error(`#${pluginId}: Failed to fix task ${task.id}: ${putRes.statusText}`);
+          }
+          
+          // Google Tasks API strict rate limits: sleep 500ms to stay well under
+          await new Promise(resolve => setTimeout(resolve, 500));
+        } catch (e) {
+            console.error(`#${pluginId}: Failed to fix task ${task.id}`, e);
+        }
+      }
+    }
+  }
+
+  if (fixedCount > 0) {
+      logseq.UI.showMsg(`Successfully fixed ${fixedCount} corrupted task titles!`, "success");
+  } else {
+      logseq.UI.showMsg("No corrupted task titles found.", "success");
   }
 }

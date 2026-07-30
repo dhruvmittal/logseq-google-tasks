@@ -2,7 +2,7 @@ import "@logseq/libs";
 
 import settingSchema from "./settings";
 
-import { handleSync } from "./gTasks";
+import { handleSync, purgeLocalTasks, fixCorruptedTitles } from "./gTasks";
 
 import "virtual:uno.css";
 
@@ -55,6 +55,28 @@ function main() {
     },
     () => {
       logseq.showSettingsUI();
+    }
+  );
+
+  logseq.App.registerCommandPalette(
+    {
+      key: "purge-google-tasks",
+      label: "Google Tasks: Purge Local History (Fix Duplicates)",
+    },
+    async () => {
+      logseq.UI.showMsg("Purging local Google Tasks... Please wait.", "warning");
+      await purgeLocalTasks();
+      logseq.UI.showMsg("Purged successfully! You can now Sync to fetch fresh tasks.", "success");
+    }
+  );
+
+  logseq.App.registerCommandPalette(
+    {
+      key: "fix-corrupted-titles",
+      label: "Google Tasks: Fix Corrupted Titles on Google",
+    },
+    async () => {
+      await fixCorruptedTitles();
     }
   );
 
