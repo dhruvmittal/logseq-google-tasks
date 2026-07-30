@@ -1,5 +1,7 @@
 # Logseq Google Tasks
 
+> **Note:** Now compatible with the new Logseq 2.0.1 (DB Version) architecture!
+
 A Google Tasks integration for Logseq with 2-way synchronization and background automation. 
 
 This plugin is a fork of [logseq-google-tasks](https://github.com/weynhamz/logseq-google-tasks) created by **[weynhamz](https://github.com/weynhamz)**. I couldn't get it working out of the box, so I figured I'd give it a go myself. I've added a few features that I wanted like background sync and automatic token renewal, and resolved some of the crashes I was experiencing. 
@@ -18,7 +20,11 @@ This plugin is a fork of [logseq-google-tasks](https://github.com/weynhamz/logse
 - **Progress Tracking:** ASCII progress bars (`[██████░░░░] 60%`) via Logseq's native toast notification system.
 - **Command Palette:** Registration of native commands for "Synchronize Now" and "Open Settings".
 
-### 3. Background Automation
+### 3. Data Management
+- **Purge Synced Data:** Added a command to safely remove all Google Tasks metadata from your Logseq graph if you want to start fresh (`Google Tasks: Purge synced tasks from graph`).
+- **Sanitize Remote Titles:** Added an emergency command to clean up Google Task titles that were corrupted by Logseq internal UUID references (`Google Tasks: Fix Corrupted Titles on Google`).
+
+### 4. Background Automation
 - **Auto-Sync Daemon:** Configurable background synchronization intervals (e.g., every 15 minutes).
 - **Silent Auth Renewal:** Background token refreshing is handled quietly without warning messages or user intervention.
 
