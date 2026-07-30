@@ -376,6 +376,8 @@ async function syncGoogleTasks(list: any, tasks: any[], localTasksByGid: Map<str
       // Use the pre-resolved updated timestamp from DataScript
       const localUpdated = localUpdatedByGid.get(task.id);
       if (localUpdated && localUpdated === task.updated) {
+        // Timestamps match on Google side, but user may have changed status locally
+        await pushLocalChanges(res[0], task);
         skipped++;
         continue;
       }
@@ -480,43 +482,41 @@ async function pushNativeTodosToGoogle() {
       throw new Error(`Could not find or create target list: ${targetListName}`);
   }
 
-  // 2. Query Logseq for active TODOs without google-task-id
-  const query = `
-    [:find (pull ?b [*])
+  // Use DataScript to find blocks tagged as Task that do NOT have a google-task-id,
+  // and resolve their status string properly
+  const pushQuery = `
+    [:find ?uuid ?status-str
      :where
-     [?b :block/tags ?tagId]
-     [?tagId :block/name "task"]]
+     [?b :block/tags ?tag]
+     [?tag :block/name "task"]
+     [?b :block/uuid ?uuid]
+     [?b :logseq.property/status ?status-entity]
+     [?status-entity :block/title ?status-str]
+     (not [?b :plugin.property.logseq-google-tasks/google-task-id _])
+     (not [?b :plugin.property._test_plugin/google-task-id _])
+    ]
   `;
   
-  const results = await logseq.DB.datascriptQuery(query);
-  const allTaskBlocks = results?.map((r: any) => {
-    const b = r[0];
-    if (b && typeof b.uuid === 'object' && b.uuid.$uuid$) b.uuid = b.uuid.$uuid$;
-    if (b && !b.properties) {
-      b.properties = {};
-      for (const k of Object.keys(b)) {
-        if (typeof k === 'string' && k.includes('/')) b.properties[k] = b[k];
+  let blocksToPush: any[] = [];
+  try {
+    const pushRes = await logseq.DB.datascriptQuery(pushQuery);
+    if (pushRes) {
+      for (const row of pushRes) {
+        let uuid = row[0];
+        const statusStr = row[1];
+        if (uuid && typeof uuid === 'object' && uuid.$uuid$) uuid = uuid.$uuid$;
+        
+        const status = (typeof statusStr === 'string' ? statusStr : '').toLowerCase();
+        const isAction = ['todo', 'doing', 'now', 'later', 'waiting'].includes(status);
+        
+        if (isAction) {
+          const sdkBlock = await logseq.Editor.getBlock(uuid);
+          if (sdkBlock) blocksToPush.push(sdkBlock);
+        }
       }
     }
-    return b;
-  }) || [];
-
-  const blocksToPush: any[] = [];
-  for (const b of allTaskBlocks) {
-    const sdkBlock = await logseq.Editor.getBlock(b.uuid);
-    if (!sdkBlock) continue;
-
-    const statusKey = Object.keys(sdkBlock.properties || {}).find(k => k.includes("status"));
-    const status = statusKey ? String(sdkBlock.properties![statusKey] || "").toLowerCase() : "";
-    
-    // Only push local tasks that are actually in an actionable state
-    const isAction = ['todo', 'doing', 'now', 'later', 'waiting'].includes(status);
-    
-    const hasGid = Object.keys(sdkBlock.properties || {}).some(k => k.includes("google-task-id"));
-
-    if (isAction && !hasGid) {
-      blocksToPush.push(sdkBlock);
-    }
+  } catch (e) {
+    console.error(`#${pluginId}: Push query failed`, e);
   }
 
   if (blocksToPush.length === 0) {
@@ -838,19 +838,34 @@ async function pushLocalChanges(block: BlockEntity, task: gapi.client.tasks.Task
     .replace(/\nDEADLINE: [^\n]*/g, '')
     .replace(/\n[^\n]*:: [^\n]*/g, '')
     .replace(/^[^\n]*:: [^\n]*\n/g, '')
-    .replace(/#Task/ig, '')
+    .replace(/#\[\[.*?\]\]/g, '') // Strip Logseq DB 2.0 internal UUID tag refs
+    .replace(/#[^\s]+/g, '')      // Strip normal tags like #Task
     .trim();
+    
   if (taskTitle !== task.title?.trim()) {
-    console.debug(taskTitle);
-    console.debug(task.title);
+    console.debug(`Title changed locally. Old: "${task.title}", New: "${taskTitle}"`);
     taskNew.title = taskTitle;
     needsUpdate = true;
   }
 
-  // Handle status update
-  const statusKey = Object.keys(block.properties || {}).find(k => k.includes("status"));
-  const rawStatus = statusKey ? block.properties![statusKey] : "";
-  const localStatus = typeof rawStatus === 'string' ? rawStatus.toLowerCase() : String(rawStatus).toLowerCase();
+  // Handle status update — resolve via DataScript since SDK returns {:db/id N}
+  let localStatus = '';
+  try {
+    const statusQuery = `
+      [:find ?status-str
+       :where
+       [?b :block/uuid #uuid "${block.uuid}"]
+       [?b :logseq.property/status ?sv]
+       [?sv :block/title ?status-str]
+      ]
+    `;
+    const statusRes = await logseq.DB.datascriptQuery(statusQuery);
+    if (statusRes && statusRes.length > 0) {
+      localStatus = (statusRes[0][0] || '').toLowerCase();
+    }
+  } catch (e) {
+    console.warn(`#${pluginId}: Could not resolve status for block ${block.uuid}`, e);
+  }
   const completedMarkers = ['done', 'cancelled', 'canceled'];
   const actionMarkers = ['todo', 'doing', 'now', 'later', 'waiting'];
 
@@ -912,11 +927,31 @@ async function pushLocalChanges(block: BlockEntity, task: gapi.client.tasks.Task
     console.debug(block);
     console.debug(taskNew);
 
-    const listIdKey = Object.keys(block.properties || {}).find(k => k.includes("google-task-list-id"));
-    const taskListId = listIdKey ? block.properties![listIdKey] : null;
+    // Resolve google-task-list-id via DataScript (SDK returns {:db/id N})
+    let taskListId: string | null = null;
+    try {
+      const listIdQuery = `
+        [:find ?lid-str
+         :where
+         [?b :block/uuid #uuid "${block.uuid}"]
+         (or
+           [?b :plugin.property.logseq-google-tasks/google-task-list-id ?pv]
+           [?b :plugin.property._test_plugin/google-task-list-id ?pv]
+         )
+         [?pv :block/title ?lid-str]
+        ]
+      `;
+      const listIdRes = await logseq.DB.datascriptQuery(listIdQuery);
+      if (listIdRes && listIdRes.length > 0) {
+        taskListId = listIdRes[0][0];
+      }
+    } catch (e) {
+      console.error(`#${pluginId}: Could not resolve google-task-list-id for block ${block.uuid}`, e);
+    }
     
     if (!taskListId) {
-      throw new Error("Missing google-task-list-id property on block.");
+      console.warn(`#${pluginId}: Missing google-task-list-id property on block ${block.uuid}, skipping.`);
+      return;
     }
     const putRes = await fetch(`https://tasks.googleapis.com/tasks/v1/lists/${taskListId}/tasks/${taskNew.id}`, {
       method: 'PUT',
@@ -939,5 +974,63 @@ async function pushLocalChanges(block: BlockEntity, task: gapi.client.tasks.Task
     updateTaskBlock(block, taskListId as string, updatedTask as gapi.client.tasks.Task);
 
     console.info(`#${pluginId}: ` + `Task ${task.id} has been changed locally`);
+  }
+}
+
+/**
+ * Scans Google Tasks for titles corrupted with Logseq internal refs and fixes them.
+ */
+export async function fixCorruptedTitles() {
+  logseq.UI.showMsg("Scanning Google Tasks for corrupted titles...", "info");
+  
+  const taskLists = await fetchTaskLists();
+  if (!taskLists) {
+    logseq.UI.showMsg("Could not fetch task lists.", "error");
+    return;
+  }
+
+  let fixedCount = 0;
+  for (const list of taskLists) {
+    const tasks = await fetchTasks(list.id as string, null);
+    if (!tasks) continue;
+
+    for (const task of tasks) {
+      if (task.title && task.title.includes('#[[')) {
+        const newTitle = task.title.replace(/#\[\[.*?\]\]/g, '').trim();
+        
+        console.info(`#${pluginId}: Fixing corrupted title: "${task.title}" -> "${newTitle}"`);
+        
+        try {
+          const putRes = await fetch(`https://tasks.googleapis.com/tasks/v1/lists/${list.id}/tasks/${task.id}`, {
+            method: 'PUT',
+            headers: {
+              'Authorization': `Bearer ${logseq.settings!.access_token}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              ...task,
+              title: newTitle
+            })
+          });
+
+          if (putRes.ok) {
+            fixedCount++;
+          } else {
+            console.error(`#${pluginId}: Failed to fix task ${task.id}: ${putRes.statusText}`);
+          }
+          
+          // Google Tasks API strict rate limits: sleep 500ms to stay well under
+          await new Promise(resolve => setTimeout(resolve, 500));
+        } catch (e) {
+            console.error(`#${pluginId}: Failed to fix task ${task.id}`, e);
+        }
+      }
+    }
+  }
+
+  if (fixedCount > 0) {
+      logseq.UI.showMsg(`Successfully fixed ${fixedCount} corrupted task titles!`, "success");
+  } else {
+      logseq.UI.showMsg("No corrupted task titles found.", "success");
   }
 }
