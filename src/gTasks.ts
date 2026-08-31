@@ -482,18 +482,26 @@ async function pushNativeTodosToGoogle() {
       throw new Error(`Could not find or create target list: ${targetListName}`);
   }
 
-  // Use DataScript to find blocks tagged as Task that do NOT have a google-task-id,
-  // and resolve their status string properly
+  // Use DataScript to find blocks tagged or referencing Task that do NOT have a google-task-id
   const pushQuery = `
-    [:find ?uuid ?status-str
+    [:find ?uuid
      :where
-     [?b :block/tags ?tag]
-     [?tag :block/name "task"]
+     (or
+       [?b :block/tags ?tag]
+       [?b :block/refs ?tag]
+     )
+     (or
+       [?tag :block/name "task"]
+       [?tag :block/name "Task"]
+       [?tag :block/title "task"]
+       [?tag :block/title "Task"]
+       [?tag :block/original-name "task"]
+       [?tag :block/original-name "Task"]
+     )
      [?b :block/uuid ?uuid]
-     [?b :logseq.property/status ?status-entity]
-     [?status-entity :block/title ?status-str]
      (not [?b :plugin.property.logseq-google-tasks/google-task-id _])
      (not [?b :plugin.property._test_plugin/google-task-id _])
+     (not [?b :logseq.property/google-task-id _])
     ]
   `;
   
@@ -503,15 +511,39 @@ async function pushNativeTodosToGoogle() {
     if (pushRes) {
       for (const row of pushRes) {
         let uuid = row[0];
-        const statusStr = row[1];
         if (uuid && typeof uuid === 'object' && uuid.$uuid$) uuid = uuid.$uuid$;
+        if (!uuid) continue;
+
+        const sdkBlock = await logseq.Editor.getBlock(uuid);
+        if (!sdkBlock) continue;
+
+        // Check DB status entity, legacy marker, or block properties
+        let statusStr = '';
+        try {
+          const statusRes = await logseq.DB.datascriptQuery(`
+            [:find ?status-str
+             :where
+             [?b :block/uuid #uuid "${uuid}"]
+             [?b :logseq.property/status ?sv]
+             [?sv :block/title ?status-str]
+            ]
+          `);
+          if (statusRes && statusRes.length > 0) statusStr = statusRes[0][0];
+        } catch (_) {}
+
+        const status = (
+          statusStr || 
+          sdkBlock.marker || 
+          sdkBlock.properties?.status || 
+          sdkBlock.properties?.["logseq.property/status"] || 
+          ''
+        ).toString().toLowerCase();
+
+        const isCompleted = ['done', 'canceled', 'cancelled'].includes(status);
         
-        const status = (typeof statusStr === 'string' ? statusStr : '').toLowerCase();
-        const isAction = ['todo', 'doing', 'now', 'later', 'waiting'].includes(status);
-        
-        if (isAction) {
-          const sdkBlock = await logseq.Editor.getBlock(uuid);
-          if (sdkBlock) blocksToPush.push(sdkBlock);
+        // Push all active tasks (or items explicitly tagged #task without a completion status)
+        if (!isCompleted) {
+          blocksToPush.push(sdkBlock);
         }
       }
     }
@@ -532,15 +564,13 @@ async function pushNativeTodosToGoogle() {
         .replace(/\nDEADLINE: [^\n]*/g, '')
         .replace(/\n[^\n]*:: [^\n]*/g, '')
         .replace(/^[^\n]*:: [^\n]*\n/g, '')
-        .replace(/#Task/ig, '')
+        .replace(/#\[\[.*?\]\]/g, '') // Strip Logseq DB 2.0 internal UUID tag refs
+        .replace(/#[^\s]+/g, '')      // Strip normal tags like #Task, #task
         .trim();
-
-      const localStatus = (block.properties?.status || block.properties?.["logseq.property/status"] || "").toLowerCase();
-      const isCompleted = localStatus === "done" || localStatus === "canceled" || localStatus === "cancelled";
 
       const newTask = {
         title: taskTitle || "Unnamed Task",
-        status: isCompleted ? 'completed' : 'needsAction'
+        status: 'needsAction'
       };
 
       const response = await fetch(`https://tasks.googleapis.com/tasks/v1/lists/${targetList.id}/tasks`, {
@@ -865,6 +895,9 @@ async function pushLocalChanges(block: BlockEntity, task: gapi.client.tasks.Task
     }
   } catch (e) {
     console.warn(`#${pluginId}: Could not resolve status for block ${block.uuid}`, e);
+  }
+  if (!localStatus) {
+    localStatus = (block.marker || block.properties?.status || block.properties?.["logseq.property/status"] || '').toString().toLowerCase();
   }
   const completedMarkers = ['done', 'cancelled', 'canceled'];
   const actionMarkers = ['todo', 'doing', 'now', 'later', 'waiting'];
