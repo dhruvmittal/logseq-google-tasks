@@ -454,32 +454,51 @@ async function pushNativeTodosToGoogle() {
   
   // 1. Find or create the list
   const taskLists = await fetchTaskLists() || [];
-  let targetList = taskLists.find(l => l.title === targetListName);
+  let targetList: any = null;
   
-  if (!targetList) {
-    if (targetListName === "@default") {
-        targetList = taskLists.find(l => l.id === "@default");
-    } else {
-        console.info(`#${pluginId}: Creating new task list: ${targetListName}`);
-        const response = await fetch('https://tasks.googleapis.com/tasks/v1/users/@me/lists', {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${logseq.settings!.access_token}`,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({ title: targetListName })
-        });
-        if (!response.ok) {
-          const e = new Error(`Failed to create list: ${response.statusText}`) as HttpError;
-          e.status = response.status;
-          throw e;
+  if (targetListName === "@default") {
+    // In Google Tasks API, '@default' is a special alias in the endpoint URL rather than an id in the list.
+    try {
+      const response = await fetch('https://tasks.googleapis.com/tasks/v1/users/@me/lists/@default', {
+        headers: {
+          'Authorization': `Bearer ${logseq.settings!.access_token}`,
+          'Content-Type': 'application/json'
         }
+      });
+      if (response.ok) {
         targetList = await response.json();
+      }
+    } catch (e) {
+      console.warn(`#${pluginId}: Failed to fetch @default list directly`, e);
+    }
+
+    // Fallback: if direct @default fetch failed, the user's primary list is the first list in Google Tasks
+    if (!targetList && taskLists.length > 0) {
+      targetList = taskLists.find(l => l.id === "@default") || taskLists[0];
+    }
+  } else {
+    targetList = taskLists.find(l => l.title === targetListName || l.id === targetListName);
+    if (!targetList) {
+      console.info(`#${pluginId}: Creating new task list: ${targetListName}`);
+      const response = await fetch('https://tasks.googleapis.com/tasks/v1/users/@me/lists', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${logseq.settings!.access_token}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ title: targetListName })
+      });
+      if (!response.ok) {
+        const e = new Error(`Failed to create list: ${response.statusText}`) as HttpError;
+        e.status = response.status;
+        throw e;
+      }
+      targetList = await response.json();
     }
   }
 
   if (!targetList) {
-      throw new Error(`Could not find or create target list: ${targetListName}`);
+    throw new Error(`Could not find or create target list: ${targetListName}`);
   }
 
   // Use DataScript to find blocks tagged or referencing Task that do NOT have a google-task-id
