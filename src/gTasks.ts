@@ -309,7 +309,8 @@ export async function handleSync(isAutoSync: boolean = false) {
       if (updRes) {
         for (const row of updRes) {
           if (typeof row[0] === 'string' && typeof row[1] === 'string') {
-            localUpdatedByGid.set(row[0], row[1]);
+            const prev = localUpdatedByGid.get(row[0]);
+            if (!prev || row[1] > prev) localUpdatedByGid.set(row[0], row[1]);
           }
         }
       }
@@ -411,34 +412,16 @@ async function syncGoogleTasks(list: any, tasks: any[], localTasksByGid: Map<str
       throw new Error(`Unable to create parent page ${parentName}`);
     }
 
-    let pageBlocksTree = await logseq.Editor.getPageBlocksTree(pageEntity.uuid);
-    let targetBlock = pageBlocksTree && pageBlocksTree.length > 0 ? pageBlocksTree[pageBlocksTree.length - 1] : null;
-    
     let generatedTasks = await Promise.all(groupTasks.map(async ([list, task]: any[]) => {
       return await blockContentGenerate(list, task);
     }));
 
-    if (!targetBlock) {
-      const firstTask = generatedTasks[0];
-      const createdBlock = await logseq.Editor.appendBlockInPage(pageEntity.uuid, firstTask.content, { properties: firstTask.properties });
-      
-      if (createdBlock) {
-        let remaining = generatedTasks.slice(1);
-        while (remaining.length > 0) {
-          await logseq.Editor.insertBatchBlock(createdBlock.uuid, remaining.slice(0, 100), { sibling: true });
-          remaining = remaining.slice(100);
+    for (const taskBlock of generatedTasks) {
+      const createdBlock = await logseq.Editor.appendBlockInPage(pageEntity.uuid, taskBlock.content, { properties: taskBlock.properties });
+      if (createdBlock && taskBlock.children) {
+        for (const child of taskBlock.children) {
+          await logseq.Editor.insertBlock(createdBlock.uuid, child.content, { sibling: false, properties: child.properties });
         }
-        
-        if (firstTask.children && firstTask.children.length > 0) {
-          await logseq.Editor.insertBatchBlock(createdBlock.uuid, firstTask.children, { sibling: false });
-        }
-      }
-    } else {
-      let remaining = generatedTasks;
-      let refUuid = targetBlock.uuid;
-      while (remaining.length > 0) {
-        await logseq.Editor.insertBatchBlock(refUuid, remaining.slice(0, 100), { sibling: true });
-        remaining = remaining.slice(100);
       }
     }
   }
@@ -750,7 +733,9 @@ async function updateTaskBlock(block: BlockEntity, list: gapi.client.tasks.TaskL
     }
   }
   if (blockNew.children && blockNew.children.length > 0) {
-    await logseq.Editor.insertBatchBlock(block.uuid, blockNew.children, { sibling: false });
+    for (const child of blockNew.children) {
+      await logseq.Editor.insertBlock(block.uuid, child.content, { sibling: false, properties: child.properties });
+    }
   }
 }
 
