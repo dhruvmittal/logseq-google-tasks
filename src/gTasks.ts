@@ -2,7 +2,7 @@ import "@logseq/libs";
 
 import { IBatchBlock, PageEntity, BlockEntity } from "@logseq/libs/dist/LSPlugin";
 
-import { format, parse } from "date-fns";
+import { format, isValid, parse } from "date-fns";
 
 const pluginId = 'logseq-google-tasks';
 
@@ -309,7 +309,8 @@ export async function handleSync(isAutoSync: boolean = false) {
       if (updRes) {
         for (const row of updRes) {
           if (typeof row[0] === 'string' && typeof row[1] === 'string') {
-            localUpdatedByGid.set(row[0], row[1]);
+            const prev = localUpdatedByGid.get(row[0]);
+            if (!prev || row[1] > prev) localUpdatedByGid.set(row[0], row[1]);
           }
         }
       }
@@ -406,39 +407,21 @@ async function syncGoogleTasks(list: any, tasks: any[], localTasksByGid: Map<str
   await showProgress("Inserting tasks to Logseq...", 90);
 
   for (let [parentName, groupTasks] of Object.entries(tasksNew)) {
-    let pageEntity = await ensurePage(parentName, false);
+    let pageEntity = await ensurePage(parentName, true);
     if (!pageEntity) {
       throw new Error(`Unable to create parent page ${parentName}`);
     }
 
-    let pageBlocksTree = await logseq.Editor.getPageBlocksTree(pageEntity.uuid);
-    let targetBlock = pageBlocksTree && pageBlocksTree.length > 0 ? pageBlocksTree[pageBlocksTree.length - 1] : null;
-    
     let generatedTasks = await Promise.all(groupTasks.map(async ([list, task]: any[]) => {
       return await blockContentGenerate(list, task);
     }));
 
-    if (!targetBlock) {
-      const firstTask = generatedTasks[0];
-      const createdBlock = await logseq.Editor.appendBlockInPage(pageEntity.uuid, firstTask.content, { properties: firstTask.properties });
-      
-      if (createdBlock) {
-        let remaining = generatedTasks.slice(1);
-        while (remaining.length > 0) {
-          await logseq.Editor.insertBatchBlock(createdBlock.uuid, remaining.slice(0, 100), { sibling: true });
-          remaining = remaining.slice(100);
+    for (const taskBlock of generatedTasks) {
+      const createdBlock = await logseq.Editor.appendBlockInPage(pageEntity.uuid, taskBlock.content, { properties: taskBlock.properties });
+      if (createdBlock && taskBlock.children) {
+        for (const child of taskBlock.children) {
+          await logseq.Editor.insertBlock(createdBlock.uuid, child.content, { sibling: false, properties: child.properties });
         }
-        
-        if (firstTask.children && firstTask.children.length > 0) {
-          await logseq.Editor.insertBatchBlock(createdBlock.uuid, firstTask.children, { sibling: false });
-        }
-      }
-    } else {
-      let remaining = generatedTasks;
-      let refUuid = targetBlock.uuid;
-      while (remaining.length > 0) {
-        await logseq.Editor.insertBatchBlock(refUuid, remaining.slice(0, 100), { sibling: true });
-        remaining = remaining.slice(100);
       }
     }
   }
@@ -454,32 +437,51 @@ async function pushNativeTodosToGoogle() {
   
   // 1. Find or create the list
   const taskLists = await fetchTaskLists() || [];
-  let targetList = taskLists.find(l => l.title === targetListName);
+  let targetList: any = null;
   
-  if (!targetList) {
-    if (targetListName === "@default") {
-        targetList = taskLists.find(l => l.id === "@default");
-    } else {
-        console.info(`#${pluginId}: Creating new task list: ${targetListName}`);
-        const response = await fetch('https://tasks.googleapis.com/tasks/v1/users/@me/lists', {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${logseq.settings!.access_token}`,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({ title: targetListName })
-        });
-        if (!response.ok) {
-          const e = new Error(`Failed to create list: ${response.statusText}`) as HttpError;
-          e.status = response.status;
-          throw e;
+  if (targetListName === "@default") {
+    // In Google Tasks API, '@default' is a special alias in the endpoint URL rather than an id in the list.
+    try {
+      const response = await fetch('https://tasks.googleapis.com/tasks/v1/users/@me/lists/@default', {
+        headers: {
+          'Authorization': `Bearer ${logseq.settings!.access_token}`,
+          'Content-Type': 'application/json'
         }
+      });
+      if (response.ok) {
         targetList = await response.json();
+      }
+    } catch (e) {
+      console.warn(`#${pluginId}: Failed to fetch @default list directly`, e);
+    }
+
+    // Fallback: if direct @default fetch failed, the user's primary list is the first list in Google Tasks
+    if (!targetList && taskLists.length > 0) {
+      targetList = taskLists.find(l => l.id === "@default") || taskLists[0];
+    }
+  } else {
+    targetList = taskLists.find(l => l.title === targetListName || l.id === targetListName);
+    if (!targetList) {
+      console.info(`#${pluginId}: Creating new task list: ${targetListName}`);
+      const response = await fetch('https://tasks.googleapis.com/tasks/v1/users/@me/lists', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${logseq.settings!.access_token}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ title: targetListName })
+      });
+      if (!response.ok) {
+        const e = new Error(`Failed to create list: ${response.statusText}`) as HttpError;
+        e.status = response.status;
+        throw e;
+      }
+      targetList = await response.json();
     }
   }
 
   if (!targetList) {
-      throw new Error(`Could not find or create target list: ${targetListName}`);
+    throw new Error(`Could not find or create target list: ${targetListName}`);
   }
 
   // Use DataScript to find blocks tagged or referencing Task that do NOT have a google-task-id
@@ -688,7 +690,7 @@ async function fetchTasks(taskListId: string, updatedMin: string | null): Promis
 async function ensurePage(page: string, isJournal: boolean = false): Promise<PageEntity | null> {
   const pageEntity = await logseq.Editor.getPage(page);
   if (!pageEntity) {
-    return await logseq.Editor.createPage(page, {}, { journal: isJournal });
+    return await logseq.Editor.createPage(page, {}, { journal: isJournal, redirect: false });
   }
   return pageEntity;
 }
@@ -731,7 +733,9 @@ async function updateTaskBlock(block: BlockEntity, list: gapi.client.tasks.TaskL
     }
   }
   if (blockNew.children && blockNew.children.length > 0) {
-    await logseq.Editor.insertBatchBlock(block.uuid, blockNew.children, { sibling: false });
+    for (const child of blockNew.children) {
+      await logseq.Editor.insertBlock(block.uuid, child.content, { sibling: false, properties: child.properties });
+    }
   }
 }
 
@@ -835,8 +839,12 @@ async function blockContentGenerate(list: gapi.client.tasks.TaskList, task: gapi
  */
 async function generateParentName(list: gapi.client.tasks.TaskList, task: gapi.client.tasks.Task): Promise<string> {
   const { preferredDateFormat } = await logseq.App.getUserConfigs();
-  const taskUpdatedDate = task.updated ? new Date(task.updated) : null;
-  const taskDueDate = task.due ? new Date(task.due) : null;
+  const parsedUpdated = task.updated ? new Date(task.updated) : null;
+  const taskUpdatedDate = parsedUpdated && isValid(parsedUpdated) ? parsedUpdated : null;
+  // Google Tasks returns `due` as UTC midnight; parse YYYY-MM-DD in local time so negative UTC offsets don't shift back a day.
+  const dueMatch = task.due?.match(/^(\d{4}-\d{2}-\d{2})/);
+  const parsedDue = dueMatch ? parse(dueMatch[1], 'yyyy-MM-dd', new Date(2000, 0, 1)) : null;
+  const taskDueDate = parsedDue && isValid(parsedDue) ? parsedDue : null;
 
   let earliestDate;
 
@@ -850,7 +858,7 @@ async function generateParentName(list: gapi.client.tasks.TaskList, task: gapi.c
     throw new Error("Neither updated date nor due date is available for the task.");
   }
 
-  return `${format(earliestDate, preferredDateFormat)}`;
+  return format(earliestDate, preferredDateFormat);
 }
 
 /**
@@ -925,12 +933,14 @@ async function pushLocalChanges(block: BlockEntity, task: gapi.client.tasks.Task
 
   // Handle deadline, format is 20240202
   if (block.deadline) {
-    let deadlineFormatted = block.deadline.toString().slice(0, 4) + '-' + block.deadline.toString().slice(4, 6) + '-' + block.deadline.toString().slice(6, 8);
-    if (!task.due || format(new Date(deadlineFormatted), 'yyyy-MM-dd') !== format(new Date(task.due as string), 'yyyy-MM-dd')) {
-      console.debug(format(new Date(deadlineFormatted), 'yyyy-MM-dd') + 'T00:00:00.000Z');
-      console.debug(task.due);
-      taskNew.due = format(new Date(deadlineFormatted), 'yyyy-MM-dd') + 'T00:00:00.000Z';
-      needsUpdate = true;
+    const raw = String(block.deadline);
+    if (/^\d{8}$/.test(raw)) {
+      const deadlineFormatted = `${raw.slice(0, 4)}-${raw.slice(4, 6)}-${raw.slice(6, 8)}`;
+      const parsedDeadline = parse(deadlineFormatted, 'yyyy-MM-dd', new Date(2000, 0, 1));
+      if (isValid(parsedDeadline) && deadlineFormatted !== task.due?.slice(0, 10)) {
+        taskNew.due = `${deadlineFormatted}T00:00:00.000Z`;
+        needsUpdate = true;
+      }
     }
   }
 
