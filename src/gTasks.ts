@@ -2,7 +2,7 @@ import "@logseq/libs";
 
 import { IBatchBlock, PageEntity, BlockEntity } from "@logseq/libs/dist/LSPlugin";
 
-import { format, parse } from "date-fns";
+import { format, isValid, parse } from "date-fns";
 
 const pluginId = 'logseq-google-tasks';
 
@@ -407,7 +407,7 @@ async function syncGoogleTasks(list: any, tasks: any[], localTasksByGid: Map<str
   await showProgress("Inserting tasks to Logseq...", 90);
 
   for (let [parentName, groupTasks] of Object.entries(tasksNew)) {
-    let pageEntity = await ensurePage(parentName, false);
+    let pageEntity = await ensurePage(parentName, true);
     if (!pageEntity) {
       throw new Error(`Unable to create parent page ${parentName}`);
     }
@@ -690,7 +690,7 @@ async function fetchTasks(taskListId: string, updatedMin: string | null): Promis
 async function ensurePage(page: string, isJournal: boolean = false): Promise<PageEntity | null> {
   const pageEntity = await logseq.Editor.getPage(page);
   if (!pageEntity) {
-    return await logseq.Editor.createPage(page, {}, { journal: isJournal });
+    return await logseq.Editor.createPage(page, {}, { journal: isJournal, redirect: false });
   }
   return pageEntity;
 }
@@ -839,8 +839,12 @@ async function blockContentGenerate(list: gapi.client.tasks.TaskList, task: gapi
  */
 async function generateParentName(list: gapi.client.tasks.TaskList, task: gapi.client.tasks.Task): Promise<string> {
   const { preferredDateFormat } = await logseq.App.getUserConfigs();
-  const taskUpdatedDate = task.updated ? new Date(task.updated) : null;
-  const taskDueDate = task.due ? new Date(task.due) : null;
+  const parsedUpdated = task.updated ? new Date(task.updated) : null;
+  const taskUpdatedDate = parsedUpdated && isValid(parsedUpdated) ? parsedUpdated : null;
+  // Google Tasks returns `due` as UTC midnight; parse YYYY-MM-DD in local time so negative UTC offsets don't shift back a day.
+  const dueMatch = task.due?.match(/^(\d{4}-\d{2}-\d{2})/);
+  const parsedDue = dueMatch ? parse(dueMatch[1], 'yyyy-MM-dd', new Date(2000, 0, 1)) : null;
+  const taskDueDate = parsedDue && isValid(parsedDue) ? parsedDue : null;
 
   let earliestDate;
 
@@ -854,7 +858,7 @@ async function generateParentName(list: gapi.client.tasks.TaskList, task: gapi.c
     throw new Error("Neither updated date nor due date is available for the task.");
   }
 
-  return `${format(earliestDate, preferredDateFormat)}`;
+  return format(earliestDate, preferredDateFormat);
 }
 
 /**
@@ -929,12 +933,14 @@ async function pushLocalChanges(block: BlockEntity, task: gapi.client.tasks.Task
 
   // Handle deadline, format is 20240202
   if (block.deadline) {
-    let deadlineFormatted = block.deadline.toString().slice(0, 4) + '-' + block.deadline.toString().slice(4, 6) + '-' + block.deadline.toString().slice(6, 8);
-    if (!task.due || format(new Date(deadlineFormatted), 'yyyy-MM-dd') !== format(new Date(task.due as string), 'yyyy-MM-dd')) {
-      console.debug(format(new Date(deadlineFormatted), 'yyyy-MM-dd') + 'T00:00:00.000Z');
-      console.debug(task.due);
-      taskNew.due = format(new Date(deadlineFormatted), 'yyyy-MM-dd') + 'T00:00:00.000Z';
-      needsUpdate = true;
+    const raw = String(block.deadline);
+    if (/^\d{8}$/.test(raw)) {
+      const deadlineFormatted = `${raw.slice(0, 4)}-${raw.slice(4, 6)}-${raw.slice(6, 8)}`;
+      const parsedDeadline = parse(deadlineFormatted, 'yyyy-MM-dd', new Date(2000, 0, 1));
+      if (isValid(parsedDeadline) && deadlineFormatted !== task.due?.slice(0, 10)) {
+        taskNew.due = `${deadlineFormatted}T00:00:00.000Z`;
+        needsUpdate = true;
+      }
     }
   }
 
